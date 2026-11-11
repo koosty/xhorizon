@@ -31,22 +31,42 @@ pub const TEXTURE_URIS: [&str; 2] = [
     "http://textures.minecraft.net/texture/{textureId}",
 ];
 
-/// `MinecraftServicesDiscoveryService`'s valid texture URIs: the discovery
-/// document's `profiles` / `getTexture` `validUris`, which
-/// `MinecraftServicesSessionService.isAllowedTextureDomain` checks texture URLs
-/// against. Production's document lists [`TEXTURE_URIS`], so they are used
-/// without asking it; another environment (`HORIZON_API_DISCOVERY`) is asked
-/// once per game, and keeps [`TEXTURE_URIS`] when its document lists none or
-/// can't be fetched.
-pub fn texture_uris() -> &'static [String] {
-    static URIS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    URIS.get_or_init(|| {
+/// The texture URL templates a Mojang account's textures may name: `MinecraftServicesDiscoveryService`'s
+/// valid URIs (the discovery document's `getTexture` `validUris`). Production lists [`TEXTURE_URIS`],
+/// so they are used without asking it; another environment is asked once per game and keeps
+/// [`TEXTURE_URIS`] when its document lists none or can't be fetched.
+static MINECRAFT_TEXTURE_URIS: std::sync::LazyLock<std::sync::Arc<[String]>> =
+    std::sync::LazyLock::new(|| {
         crate::auth::discovery_overridden()
             .then(|| crate::auth::discovery().ok())
             .flatten()
             .and_then(|doc| discovery_texture_uris(&doc))
             .unwrap_or_else(|| TEXTURE_URIS.map(str::to_owned).to_vec())
-    })
+            .into()
+    });
+
+/// The texture URL templates the account this game runs as may load: Mojang's. A Horizon
+/// account's templates come from its mod (`native_account_texture_uris`); without one it has none.
+pub fn texture_uris() -> std::sync::Arc<[String]> {
+    let mut answer = None;
+    crate::gfx::native_render::native_account_texture_uris(&mut answer);
+    if let Some(uris) = answer {
+        return uris.into();
+    }
+    if horizon_account() {
+        return Vec::new().into();
+    }
+    MINECRAFT_TEXTURE_URIS.clone()
+}
+
+fn horizon_account() -> bool {
+    crate::auth::current().is_some_and(|s| s.is_horizon_account())
+}
+
+/// Whether a custom account's textures wait on its discovery document. A profile
+/// prepared meanwhile must not be memoized, or it keeps no skin.
+pub fn textures_pending() -> bool {
+    horizon_account() && crate::auth::cached_discovery_for_process().is_none()
 }
 
 /// The `profiles` / `getTexture` endpoint's `validUris` in a discovery
@@ -97,9 +117,10 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[impl AsRef<str>])
         let Some(url) = texture.get("url").and_then(|u| u.as_str()) else {
             return empty;
         };
-        let allowed = valid_uris
-            .iter()
-            .any(|u| url.starts_with(&u.as_ref().replace("{textureId}", "")));
+        let allowed = valid_uris.iter().any(|u| {
+            let u: &str = u.as_ref();
+            url.starts_with(&u.replace("{textureId}", ""))
+        });
         if !allowed {
             return empty;
         }
@@ -126,13 +147,14 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[impl AsRef<str>])
 /// those textures be unsigned (`getInsecureSkinInformation`).
 pub fn profile_skin_url(profile: &serde_json::Value) -> Option<String> {
     let (value, signature) = parse_profile(profile).textures?;
-    unpack(&value, signature, texture_uris()).skin
+    unpack(&value, signature, &texture_uris()[..]).skin
 }
 
 /// The textures of a Minecraft services `/minecraft/profile` answer: the
 /// `ACTIVE` skin and cape (`MinecraftProfileResponse`). Unsigned, like the
 /// local player's own textures, and only URLs under the allowed domains count.
 pub fn services_profile_textures(profile: &serde_json::Value) -> Textures {
+    let uris = texture_uris();
     let active = |key: &str| {
         profile
             .get(key)?
@@ -145,8 +167,7 @@ pub fn services_profile_textures(profile: &serde_json::Value) -> Textures {
         .and_then(|t| t.get("url"))
         .and_then(|u| u.as_str())
         .filter(|url| {
-            texture_uris()
-                .iter()
+            uris.iter()
                 .any(|u| url.starts_with(&u.replace("{textureId}", "")))
         })
         .map(str::to_owned);
@@ -158,8 +179,7 @@ pub fn services_profile_textures(profile: &serde_json::Value) -> Textures {
         .and_then(|t| t.get("url"))
         .and_then(|u| u.as_str())
         .filter(|url| {
-            texture_uris()
-                .iter()
+            uris.iter()
                 .any(|u| url.starts_with(&u.replace("{textureId}", "")))
         })
         .map(str::to_owned);
@@ -186,7 +206,7 @@ pub fn profile_skin_url_nbt(profile: &horizon_world::nbt::Tag) -> Option<String>
             .then(|| nbt_text(p.get("value")))
             .flatten()
     })?;
-    unpack(&value, Signature::Unsigned, texture_uris()).skin
+    unpack(&value, Signature::Unsigned, &texture_uris()[..]).skin
 }
 
 /// `ResolvableProfile.skinPatch().body()` of a skull's `profile` NBT: the
@@ -287,7 +307,7 @@ fn valid_player_name(name: &str) -> bool {
 /// `fetchByNameOrId`: `getByName` answers `{id, name}`; `getProfileById`
 /// (`fetchProfile(id, requireSecure)`) answers `{id, name, properties}` —
 /// asked `unsigned=false` so the `textures` property is signed.
-fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedProfile> {
+pub(crate) fn resolve_profile(key: &NameOrId, doc: &serde_json::Value) -> Option<ResolvedProfile> {
     let id = match key {
         NameOrId::Id(id) => *id,
         NameOrId::Name(name) => {
@@ -391,7 +411,7 @@ impl Resolver {
         }
         let (key, send) = (key.clone(), self.send.clone());
         std::thread::spawn(move || {
-            let resolved = crate::auth::discovery()
+            let resolved = crate::auth::discovery_for_process()
                 .ok()
                 .and_then(|doc| resolve_profile(&key, &doc));
             let _ = send.send((key, resolved));
@@ -509,7 +529,7 @@ struct HeadProfile {
 fn prepare_head(profile: &serde_json::Value) -> HeadProfile {
     let info = parse_profile(profile);
     let skin = info.textures.as_ref().and_then(|(value, signature)| {
-        let url = unpack(value, *signature, texture_uris()).skin?;
+        let url = unpack(value, *signature, &texture_uris()[..]).skin?;
         let location = skin_location(&texture_hash(&url)?);
         Some((url, location))
     });
@@ -532,7 +552,9 @@ impl HeadProfiles {
             self.entries.clear();
         }
         let parsed = std::sync::Arc::new(prepare_head(profile));
-        self.entries.insert(profile.clone(), parsed.clone());
+        if !textures_pending() {
+            self.entries.insert(profile.clone(), parsed.clone());
+        }
         parsed
     }
 }
@@ -597,7 +619,9 @@ pub fn head_skin(
                 let parsed = std::sync::Arc::new(prepare_head(
                     &serde_json::json!({"properties": [property]}),
                 ));
-                cache.insert(value.clone(), parsed.clone());
+                if !textures_pending() {
+                    cache.insert(value.clone(), parsed.clone());
+                }
                 Some(parsed)
             }
             _ => None,
@@ -782,7 +806,7 @@ fn read_offline_skin(path: &std::path::Path, model: &str) -> Result<(Vec<u8>, bo
 /// `fetchProfile(id, true)`, so its `textures` property is signed), or empty
 /// without an answer. Blocks on the network.
 pub fn fetch_own_properties(id: u128) -> Vec<(String, String, Option<String>)> {
-    crate::auth::discovery()
+    crate::auth::discovery_for_process()
         .ok()
         .and_then(|doc| resolve_profile(&NameOrId::Id(id), &doc))
         .map(|p| p.properties)
@@ -1331,6 +1355,9 @@ fn http_get(url: &str) -> Option<Vec<u8>> {
     use std::io::Read;
     let response = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(15))
+        // A custom service's skin domains are the only hosts its textures may come from:
+        // a redirect elsewhere is refused.
+        .redirects(if horizon_account() { 0 } else { 5 })
         .user_agent("Java")
         .build()
         .get(url)
@@ -2027,6 +2054,7 @@ mod tests {
         );
         assert_eq!(served.load(Ordering::SeqCst), 2);
     }
+
 }
 
 #[cfg(test)]

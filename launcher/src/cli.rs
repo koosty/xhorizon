@@ -1907,10 +1907,10 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                     "accounts": accounts.accounts.iter().map(|a| serde_json::json!({
                         "name": a.name, "uuid": a.uuid,
                         "selected": accounts.selected.as_ref() == Some(&a.uuid),
-                        "authentication": account::session::status(account::store(), &a.uuid),
+                        "authentication": account::session::status(account::store(), &a.secret_key()),
                     })).collect::<Vec<_>>(),
                     "sign_in_configured": account::client_id().is_some(),
-                    "owner": accounts.has_owner(account::store()),
+                    "owner": accounts.can_play(account::store()),
                 }));
             } else if accounts.accounts.is_empty() {
                 println!(
@@ -1924,7 +1924,7 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                     } else {
                         " "
                     };
-                    let status = account::session::status(account::store(), &a.uuid);
+                    let status = account::session::status(account::store(), &a.secret_key());
                     // Why it couldn't be checked (a keyring that didn't answer, #12179).
                     let why = match status.state {
                         account::session::State::Retry => format!(": {}", status.message),
@@ -1932,12 +1932,19 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
                     };
                     println!("{mark} {}  {}  {}{why}", a.name, a.uuid, status.label());
                 }
-                if !accounts.has_owner(account::store()) {
-                    println!(
-                        "{} {}",
-                        account::NoOwner::default(),
-                        tr(backend::SIGN_IN_HINT)
-                    );
+                if !accounts.can_play(account::store()) {
+                    if accounts.provider() == account::Provider::HorizonAccount {
+                        println!(
+                            "{} Sign in from the launcher window.",
+                            account::NEEDS_HORIZON_ACCOUNT
+                        );
+                    } else {
+                        println!(
+                            "{} {}",
+                            account::NoOwner::default(),
+                            tr(backend::SIGN_IN_HINT)
+                        );
+                    }
                 }
             }
         }
@@ -2010,9 +2017,12 @@ fn account_command(action: AccountCmd, as_json: bool) -> Result<(), String> {
         }
         AccountCmd::SignOut { who } => {
             let a = find(&accounts, &who)?;
-            accounts.remove(account::store(), &a.uuid)?;
+            let unconfirmed = accounts.sign_out(account::store(), &a.uuid)?;
             accounts.save()?;
             println!("Signed out {}.", a.name);
+            if let Some(text) = unconfirmed {
+                eprintln!("{text}");
+            }
         }
         AccountCmd::Select { who } => {
             let a = find(&accounts, &who)?;

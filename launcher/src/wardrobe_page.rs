@@ -818,6 +818,8 @@ impl Launcher {
         };
         let account = account::Account {
             uuid: "00000000000000000000000000000001".into(),
+            provider: account::Provider::Mojang,
+            auth_base_url: None,
             name: "Preview".into(),
             skin: None,
             cape: None,
@@ -1263,7 +1265,7 @@ impl Launcher {
         let t = self.theme;
         let sign_in = button(
             "wardrobe-sign-in",
-            "Sign in with Microsoft",
+            microsoft::sign_in_label(self.settings.authenticate_with),
             Kind::Primary,
             &t,
         )

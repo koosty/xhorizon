@@ -1,0 +1,17 @@
+{
+  "hooks": [
+    {
+      "name": "account_join",
+      "target": "horizon_client_render::gfx::native_render::native_account_join",
+      "side": "client",
+      "cancellable": false,
+      "mod_api": {
+        "contract": "replace",
+        "out": "answer"
+      }
+    }
+  ],
+  "rust_summary": "an account's server join, answered by a mod before the game asks its session service (`native_account_join`).",
+  "doc_summary": "`native_account_join(session, server_hash, answer)` runs before `join_server` asks the session service: the first mod to answer sets `answer`, and the game returns it. Without an answer, a non-Mojang account is refused. Bundles need \"hooks\": @API:account_join@.",
+  "comments": ["crates/horizon-client-render/src/gfx/native_render.rs"]
+}

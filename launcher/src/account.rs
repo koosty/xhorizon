@@ -12,6 +12,7 @@
 //!
 //! The Azure app (client ID) is Horizon's own and is configuration: `HORIZON_MSA_CLIENT_ID` at
 //! build time, or at run time to override it. Without one, sign-in says it is not configured.
+pub mod horizon_account_sign_in;
 pub mod session;
 
 use serde_json::{json, Value};
@@ -20,6 +21,80 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Which service signs the player in (`Settings::authenticate_with`). The settings file stores
+/// these lowercase names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Authenticate {
+    /// Microsoft and Mojang: the owner gate applies.
+    #[default]
+    Mojang,
+    /// The Horizon Account Provider at `Settings::horizon_account_url`.
+    #[serde(rename = "horizon_account")]
+    HorizonAccount,
+}
+
+/// The host of a custom auth address, lowercased, without the port. The address must be
+/// `https://` with a plain host, an optional port from 1 to 65535, and an optional path;
+/// credentials, a query or a fragment are refused. The `Err` text is English, to be passed
+/// through `tr` by the window.
+pub fn horizon_account_host(url: &str) -> Result<String, &'static str> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("Enter the address of the auth service.");
+    }
+    if url.chars().any(char::is_whitespace) {
+        return Err("The address can't contain spaces.");
+    }
+    let Some(rest) = url
+        .get(..8)
+        .filter(|s| s.eq_ignore_ascii_case("https://"))
+        .map(|_| &url[8..])
+    else {
+        return Err("The address must start with https://.");
+    };
+    if rest.contains(['?', '#']) {
+        return Err("The address can't have a query or a fragment.");
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('@') {
+        return Err("The address can't contain a username or password.");
+    }
+    if authority.starts_with('[') {
+        return Err("IPv6 addresses aren't supported. Use a host name.");
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let port_ok = port.is_none_or(|p| {
+        p.bytes().all(|b| b.is_ascii_digit()) && matches!(p.parse::<u16>(), Ok(n) if n > 0)
+    });
+    if !port_ok {
+        return Err("The port must be a number from 1 to 65535.");
+    }
+    if host.is_empty() {
+        return Err("The address has no host.");
+    }
+    let plain = host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    if !plain {
+        return Err("The host name has characters an address can't use.");
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+/// Whether the window warns that the custom address changed: the player signs in
+/// through Custom URL, and has not yet trusted this address.
+pub fn warn_about_address(
+    choice: Authenticate,
+    address: Option<&str>,
+    trusted: Option<&str>,
+) -> bool {
+    choice == Authenticate::HorizonAccount && address.is_some() && address != trusted
+}
+
 /// The keychain service name every secret is stored under.
 pub const SERVICE: &str = "dev.playhorizon.launcher";
 const SCOPE: &str = "XboxLive.signin offline_access";
@@ -27,6 +102,11 @@ pub const NOT_CONFIGURED: &str = "This build of the launcher has no Microsoft si
 /// What every Play says while no account in the launcher owns the game.
 pub const NEEDS_OWNER: &str =
     "Sign in with a Microsoft account that owns Minecraft: Java Edition to play";
+/// What Play says under Horizon Account Provider URL while no Horizon Account Provider account is signed in.
+pub const NEEDS_HORIZON_ACCOUNT: &str = "Sign in with a Horizon Account Provider account to play";
+/// Refused for a launch as an account of the other service (Authenticate With).
+pub const NOT_THIS_SERVICE: &str =
+    "That account isn't used while Authenticate With is set to another service.";
 const DOES_NOT_OWN: &str = "This account doesn't own Minecraft: Java Edition.";
 const NO_PROFILE: &str =
     "This account has no Minecraft profile yet. Create one at minecraft.net, then sign in again.";
@@ -44,6 +124,12 @@ pub fn client_id() -> Option<String> {
         .or_else(|| option_env!("HORIZON_MSA_CLIENT_ID").map(str::to_owned))
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty())
+}
+
+/// Whether sign-in can start for this choice: a Microsoft sign-in needs the build's client ID,
+/// a custom sign-in needs no client ID here.
+pub fn sign_in_configured(choice: Authenticate) -> bool {
+    choice == Authenticate::HorizonAccount || client_id().is_some()
 }
 
 /// Where the requests go: the real services, or a mock in tests.
@@ -418,6 +504,26 @@ fn owns_game(ep: &Endpoints, token: &str) -> Result<bool, String> {
         }))
 }
 
+/// Which service signed an account in. Accounts saved before providers existed are Mojang.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    /// Microsoft sign-in, through Mojang's services.
+    #[default]
+    Mojang,
+    /// The Horizon Account Provider at the account's `auth_base_url`.
+    #[serde(rename = "horizon_account")]
+    HorizonAccount,
+}
+
+/// The service `mode` signs in through.
+pub fn provider_for(mode: Authenticate) -> Provider {
+    match mode {
+        Authenticate::Mojang => Provider::Mojang,
+        Authenticate::HorizonAccount => Provider::HorizonAccount,
+    }
+}
+
 /// A Minecraft profile, as the launcher shows and remembers it (no secrets).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
@@ -429,6 +535,24 @@ pub struct Account {
     pub skin: Option<(String, String)>,
     #[serde(default)]
     pub cape: Option<String>,
+    /// The service that signed the account in.
+    #[serde(default)]
+    pub provider: Provider,
+    /// A custom account's auth service (https base URL); none for Mojang.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_base_url: Option<String>,
+}
+
+impl Account {
+    /// The keychain key for this account's secrets. A Mojang account keeps its UUID, so sign-ins
+    /// saved before providers still load. A custom key starts with `custom:`, which no UUID can
+    /// start with, so the two never collide.
+    pub fn secret_key(&self) -> String {
+        match self.provider {
+            Provider::Mojang => self.uuid.clone(),
+            Provider::HorizonAccount => format!("horizon_account:{}", self.uuid),
+        }
+    }
 }
 
 /// The profile; none when the account has none (it doesn't own the game, or never made one).
@@ -468,6 +592,8 @@ fn profile(ep: &Endpoints, token: &str) -> Result<Option<Account>, String> {
             ))
         }),
         cape: active("capes").and_then(|c| str_field(&c, "url")),
+        provider: Provider::Mojang,
+        auth_base_url: None,
     }))
 }
 
@@ -539,8 +665,9 @@ enum Check {
     NoAnswer(String, Secrets),
 }
 
-/// Asks whether `account` owns the game, with a Minecraft token renewed through the refresh token
-/// first when it has less than an hour left. The secrets come back renewed whatever the answer.
+/// Asks whether `account` owns the game, with a Microsoft token renewed through the refresh token
+/// first when it has less than an hour left. Custom accounts are checked by
+/// `horizon_account_sign_in::check` instead. The secrets come back renewed whatever the answer.
 fn check(ep: &Endpoints, client_id: Option<&str>, account: &Account, secrets: Secrets) -> Check {
     check_with(ep, client_id, account, secrets, false, &|_| {})
 }
@@ -553,6 +680,9 @@ fn check_with(
     force: bool,
     progress: &dyn Fn(session::Phase),
 ) -> Check {
+    if matches!(account.provider, Provider::HorizonAccount) {
+        return horizon_account_sign_in::check(account, secrets, force);
+    }
     if secrets.sign_in_required {
         return Check::NoAnswer(SIGN_IN_AGAIN.into(), secrets);
     }
@@ -587,7 +717,13 @@ fn check_with(
             return Ok(None);
         }
         progress(session::Phase::Profile);
-        profile(ep, token)
+        profile(ep, token).map(|p| {
+            p.map(|p| Account {
+                provider: account.provider,
+                auth_base_url: account.auth_base_url.clone(),
+                ..p
+            })
+        })
     }) {
         Err(e) => Check::NoAnswer(e, secrets),
         Ok(None) => Check::DoesNot(Secrets {
@@ -1700,12 +1836,16 @@ pub struct Accounts {
     /// `offline_selected` and `looks` are dropped on read.
     #[serde(default, rename = "offline", skip_serializing)]
     old_offline: Vec<String>,
+    /// Which service signs the player in (Authenticate With). Set at load from Settings and on
+    /// every setting change, so the gate never takes a mode argument.
+    #[serde(default, skip)]
+    pub mode: Authenticate,
 }
 
-/// The secrets an account keeps in `store`, if it still has them there.
-fn secrets_in(store: &dyn SecretStore, uuid: &str) -> Option<Secrets> {
+/// The secrets an account keeps in `store`, under its secret key, if it still has them there.
+fn secrets_in(store: &dyn SecretStore, account: &Account) -> Option<Secrets> {
     store
-        .get(uuid)
+        .get(&account.secret_key())
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -1716,7 +1856,9 @@ impl Accounts {
         crate::backend::data_dir().join("accounts.json")
     }
     pub fn load() -> Self {
-        Self::load_from(&Self::path())
+        let mut accounts = Self::load_from(&Self::path());
+        accounts.mode = crate::backend::Settings::load().authenticate_with;
+        accounts
     }
     pub fn save(&self) -> Result<(), String> {
         self.save_to(&Self::path())
@@ -1773,8 +1915,16 @@ impl Accounts {
         account: Account,
         secrets: &Secrets,
     ) -> Result<(), String> {
+        // The list and `selected` key accounts by UUID, so one UUID is one account.
+        if self
+            .accounts
+            .iter()
+            .any(|a| a.uuid == account.uuid && a.provider != account.provider)
+        {
+            return Err("That profile is signed in with another service.".into());
+        }
         store.set(
-            &account.uuid,
+            &account.secret_key(),
             &serde_json::to_string(secrets).map_err(|e| e.to_string())?,
         )?;
         self.selected = Some(account.uuid.clone());
@@ -1784,7 +1934,7 @@ impl Accounts {
         }
         Ok(())
     }
-    /// Whether an account here owned the game at its last check (the keychain's answer, no
+    /// Whether a Mojang account here owned the game at its last check (the keychain's answer, no
     /// request): what Play needs.
     pub fn has_owner(&self, store: &dyn SecretStore) -> bool {
         // The selected account first: it owning the game ends the search after one account's
@@ -1792,13 +1942,56 @@ impl Accounts {
         self.selected()
             .into_iter()
             .chain(self.accounts.iter().filter(|a| Some(*a) != self.selected()))
-            .any(|a| secrets_in(store, &a.uuid).is_some_and(|s| s.owns))
+            .filter(|a| a.provider == Provider::Mojang)
+            .any(|a| secrets_in(store, a).is_some_and(|s| s.owns))
     }
 
-    /// Plays as the signed-in account `uuid`.
+    /// The service Authenticate With signs in through.
+    pub fn provider(&self) -> Provider {
+        provider_for(self.mode)
+    }
+
+    /// Whether the active service can start the game now: a Mojang account that owns it, or a
+    /// Horizon Account Provider account signed in.
+    pub fn can_play(&self, store: &dyn SecretStore) -> bool {
+        match self.provider() {
+            Provider::Mojang => self.has_owner(store),
+            Provider::HorizonAccount => self
+                .accounts
+                .iter()
+                .any(|a| a.provider == Provider::HorizonAccount && secrets_in(store, a).is_some()),
+        }
+    }
+
+    /// Switches the active service (Authenticate With) and moves the player to its accounts: the
+    /// selected account when it is one of them, else the first of them, else none. Every account
+    /// stays in the list.
+    pub fn follow(&mut self, mode: Authenticate) {
+        self.mode = mode;
+        let provider = provider_for(mode);
+        if self.selected().is_some_and(|a| a.provider == provider) {
+            return;
+        }
+        self.selected = self
+            .accounts
+            .iter()
+            .find(|a| a.provider == provider)
+            .map(|a| a.uuid.clone());
+    }
+
+    /// Plays as the signed-in account `uuid`, of the service Authenticate With signs in through.
     pub fn play_as(&mut self, uuid: &str) -> Result<(), String> {
         if !self.accounts.iter().any(|a| a.uuid == uuid) {
             return Err("That account isn't signed in.".into());
+        }
+        // The list offers only the accounts of the active service: this guard trips only if a
+        // caller passes an account the selection could never have offered.
+        if self
+            .accounts
+            .iter()
+            .any(|a| a.uuid == uuid && a.provider != self.provider())
+        {
+            return Err(NOT_THIS_SERVICE.into());
         }
         self.selected = Some(uuid.to_string());
         Ok(())
@@ -1814,12 +2007,73 @@ impl Accounts {
     /// Sign out: the secrets leave the keychain, the account the list.
     pub fn remove(&mut self, store: &dyn SecretStore, uuid: &str) -> Result<(), String> {
         let _operation = session::lock(store)?;
-        store.delete(uuid)?;
+        self.remove_locked(store, uuid)
+    }
+
+    /// `remove` for a caller that already holds the session lock.
+    fn remove_locked(&mut self, store: &dyn SecretStore, uuid: &str) -> Result<(), String> {
+        // Every listed entry with this UUID: its secrets go, each under its own key. None
+        // listed: the UUID's key, as before (only orphaned secrets are left).
+        let mut keys: Vec<String> = self
+            .accounts
+            .iter()
+            .filter(|a| a.uuid == uuid)
+            .map(Account::secret_key)
+            .collect();
+        if keys.is_empty() {
+            keys.push(uuid.to_string());
+        }
+        for key in &keys {
+            store.delete(key)?;
+        }
         self.accounts.retain(|a| a.uuid != uuid);
         if self.selected.as_deref() == Some(uuid) {
             self.selected = None;
         }
         Ok(())
+    }
+
+    /// Signs out of `uuid`. A custom account's tokens are revoked on its service; the local
+    /// copy leaves either way. The text returned says when the service did not confirm it.
+    pub fn sign_out(
+        &mut self,
+        store: &dyn SecretStore,
+        uuid: &str,
+    ) -> Result<Option<String>, String> {
+        self.sign_out_with(store, uuid, &horizon_account_sign_in::revoke_account)
+    }
+
+    /// `sign_out` with the revoke step passed in. `revoke` gets the custom account and the token it held.
+    fn sign_out_with(
+        &mut self,
+        store: &dyn SecretStore,
+        uuid: &str,
+        revoke: &dyn Fn(&Account, &str) -> bool,
+    ) -> Result<Option<String>, String> {
+        // The token is read under the lock, before the local copy goes; the revoke runs after it.
+        let (custom, held, removed) = {
+            let _operation = session::lock(store)?;
+            let custom = self
+                .accounts
+                .iter()
+                .find(|a| a.uuid == uuid && matches!(a.provider, Provider::HorizonAccount))
+                .cloned();
+            let held = custom
+                .as_ref()
+                .and_then(|a| secrets_in(store, a))
+                .map(|s| s.minecraft_token);
+            // A keychain that refuses a delete still leaves the token live on the service, so the
+            // revoke runs either way; the removal's error is reported after it.
+            let removed = self.remove_locked(store, uuid);
+            (custom, held, removed)
+        };
+        let Some(account) = custom else {
+            removed?;
+            return Ok(None);
+        };
+        let confirmed = held.is_some_and(|token| revoke(&account, &token));
+        removed?;
+        Ok((!confirmed).then(|| horizon_account_sign_in::SIGN_OUT_UNCONFIRMED.to_owned()))
     }
 }
 
@@ -1891,7 +2145,13 @@ pub fn launch(
     accounts: &mut Accounts,
 ) -> Result<Launch, NoOwner> {
     let selected = accounts.selected.clone();
-    let mut order = accounts.accounts.clone();
+    // The owner gate is Mojang's: a custom account never answers it.
+    let mut order: Vec<Account> = accounts
+        .accounts
+        .iter()
+        .filter(|a| a.provider == Provider::Mojang)
+        .cloned()
+        .collect();
     order.sort_by_key(|a| Some(&a.uuid) != selected.as_ref());
     let mut pass = Launch::default();
     let mut owned = false;
@@ -1902,7 +2162,7 @@ pub fn launch(
         }
         let plays = Some(&account.uuid) == selected.as_ref();
         let operation = session::lock(store);
-        let read = match store.get(&account.uuid) {
+        let read = match store.get(&account.secret_key()) {
             Ok(text) => text.and_then(|s| serde_json::from_str::<Secrets>(&s).ok()),
             Err(why) => {
                 // Not "signed out": the keyring didn't say (#12179). With no owner, the refusal
@@ -1949,22 +2209,8 @@ pub fn launch(
         if plays {
             pass.offline = said;
         }
-        let after = serde_json::to_string(&secrets).ok();
-        if after != before {
-            if let Some(text) = after {
-                // The game still starts; the player hears why the next launch may ask again.
-                if let Err(e) = store.set(&account.uuid, &text) {
-                    let said = format!(
-                        "{}'s renewed sign-in couldn't be saved in the keychain ({e}): you may \
-                         have to sign in again next time.",
-                        account.name
-                    );
-                    if let Ok(mut last) = UNSAVED.lock() {
-                        *last = Some(said.clone());
-                    }
-                    pass.unsaved = Some(said);
-                }
-            }
+        if let Some(said) = keep_renewed(store, &account, before, &secrets) {
+            pass.unsaved = Some(said);
         }
     }
     if owned {
@@ -1976,9 +2222,103 @@ pub fn launch(
     }
 }
 
+/// Keeps renewed secrets in the store when they changed. Returns the message when the keychain
+/// refuses to keep them: the game still starts, and the player hears why the next launch may ask
+/// again.
+fn keep_renewed(
+    store: &dyn SecretStore,
+    account: &Account,
+    before: Option<String>,
+    secrets: &Secrets,
+) -> Option<String> {
+    let text = serde_json::to_string(secrets).ok()?;
+    if Some(&text) == before.as_ref() {
+        return None;
+    }
+    let e = store.set(&account.secret_key(), &text).err()?;
+    let said = format!(
+        "{}'s renewed sign-in couldn't be saved in the keychain ({e}): you may \
+         have to sign in again next time.",
+        account.name
+    );
+    if let Ok(mut last) = UNSAVED.lock() {
+        *last = Some(said.clone());
+    }
+    Some(said)
+}
+
+/// The Horizon Account Provider account Authenticate With plays as: the selected one when it is
+/// of that service, else the first of its accounts.
+fn horizon_account_player(accounts: &Accounts) -> Option<Account> {
+    let selected = accounts.selected.as_ref();
+    accounts
+        .accounts
+        .iter()
+        .filter(|a| a.provider == Provider::HorizonAccount)
+        .min_by_key(|a| Some(&a.uuid) != selected)
+        .cloned()
+}
+
+/// The game starts as a Horizon Account Provider account: it renews through its own service, and
+/// no Mojang account is asked. Such an account needs no owner of Minecraft, so there is no owner
+/// gate.
+fn launch_custom(
+    ep: &Endpoints,
+    client_id: Option<&str>,
+    store: &dyn SecretStore,
+    accounts: &mut Accounts,
+) -> Result<Launch, String> {
+    let Some(account) = horizon_account_player(accounts) else {
+        return Err(NEEDS_HORIZON_ACCOUNT.into());
+    };
+    let operation = session::lock(store);
+    let Some(secrets) = secrets_in(store, &account) else {
+        return Err(format!(
+            "{} is no longer signed in on this computer. Sign in again.",
+            account.name
+        ));
+    };
+    let before = serde_json::to_string(&secrets).ok();
+    let checked = match &operation {
+        Ok(_) => check(ep, client_id, &account, secrets),
+        Err(e) => Check::NoAnswer(e.clone(), secrets),
+    };
+    let mut pass = Launch::default();
+    let secrets = match checked {
+        Check::Owns(renewed, secrets) => {
+            accounts.update(renewed.clone());
+            pass.session = Some((renewed, secrets.clone()));
+            secrets
+        }
+        Check::NoAnswer(e, secrets) => {
+            pass.offline = Some(e);
+            secrets
+        }
+        // The custom check never says "doesn't own"; a custom account that can't play is refused.
+        Check::DoesNot(_) => return Err(NEEDS_HORIZON_ACCOUNT.into()),
+    };
+    pass.unsaved = keep_renewed(store, &account, before, &secrets);
+    Ok(pass)
+}
+
+/// The owner gate for the setting Authenticate With: Mojang's gate for Mojang, the custom
+/// account's session for Horizon Account Provider. A refusal says why that account can't play.
+pub fn launch_for_mode(
+    ep: &Endpoints,
+    client_id: Option<&str>,
+    store: &dyn SecretStore,
+    accounts: &mut Accounts,
+) -> Result<Launch, NoOwner> {
+    match accounts.provider() {
+        Provider::Mojang => launch_for_game(ep, client_id, store, accounts),
+        Provider::HorizonAccount => launch_custom(ep, client_id, store, accounts)
+            .map_err(|why| NoOwner { keyring: Some(why) }),
+    }
+}
+
 /// The owner gate before the game starts: [`launch`], where the account that plays (the selected
-/// one, else the first) must own the game itself, by the services' answer or, when they can't be
-/// asked, its last one. Never another account's ownership for a name of its own.
+/// one, else the first Mojang account) must own the game itself, by the services' answer or, when
+/// they can't be asked, its last one. Another account's ownership never counts for it.
 pub fn launch_for_game(
     ep: &Endpoints,
     client_id: Option<&str>,
@@ -1986,12 +2326,17 @@ pub fn launch_for_game(
     accounts: &mut Accounts,
 ) -> Result<Launch, NoOwner> {
     if accounts.selected().is_none() {
-        accounts.selected = accounts.accounts.first().map(|a| a.uuid.clone());
+        accounts.selected = accounts
+            .accounts
+            .iter()
+            .find(|a| a.provider == Provider::Mojang)
+            .map(|a| a.uuid.clone());
     }
     let pass = launch(ep, client_id, store, accounts)?;
     let owns = accounts
         .selected()
-        .and_then(|a| secrets_in(store, &a.uuid))
+        .filter(|a| a.provider == Provider::Mojang)
+        .and_then(|a| secrets_in(store, a))
         .is_some_and(|s| s.owns);
     if owns {
         Ok(pass)
@@ -2040,13 +2385,24 @@ pub fn write_session_file(
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(&path).map_err(|e| e.to_string())?;
-    let body = json!({
-        "name": account.name,
-        "uuid": account.uuid,
-        "access_token": secrets.minecraft_token,
-        "user_type": "msa",
-        "xuid": secrets.xuid,
-    });
+    let body = match account.provider {
+        Provider::Mojang => json!({
+            "name": account.name,
+            "uuid": account.uuid,
+            "access_token": secrets.minecraft_token,
+            "user_type": "msa",
+            "xuid": secrets.xuid,
+        }),
+        // The game refuses a custom session without an https `auth_base_url`.
+        Provider::HorizonAccount => json!({
+            "name": account.name,
+            "uuid": account.uuid,
+            "access_token": secrets.minecraft_token,
+            "user_type": "horizon_account",
+            "provider": "horizon_account",
+            "auth_base_url": account.auth_base_url,
+        }),
+    };
     std::io::Write::write_all(&mut file, body.to_string().as_bytes()).map_err(|e| e.to_string())?;
     Ok(path)
 }
@@ -2157,6 +2513,8 @@ pub enum SignInState {
     Starting,
     /// Waiting for the player at `verification_uri` with `user_code`.
     Code(DeviceCode),
+    /// Waiting for the player to sign in on the custom service's page at this authorize URL.
+    Browser(String),
     Working(session::Phase),
     Done(Result<Account, String>),
 }
@@ -2175,6 +2533,43 @@ impl SignIn {
     /// Restore this exact Minecraft identity without changing who currently plays.
     pub fn start_for(account: Account) -> Self {
         Self::start_expected(Some(account))
+    }
+
+    /// Sign in with the custom auth service at `base` (`horizon_account_sign_in::sign_in`). The browser
+    /// address arrives as `SignInState::Browser`; the account is saved like a Microsoft sign-in.
+    pub fn start_horizon_account(base: String) -> Self {
+        use std::sync::atomic::Ordering;
+        let state = std::sync::Arc::new(Mutex::new(SignInState::Starting));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (thread_state, thread_cancel) = (state.clone(), cancel.clone());
+        std::thread::spawn(move || {
+            let set = |s| *thread_state.lock().unwrap() = s;
+            let cancelled = || thread_cancel.load(Ordering::Relaxed);
+            let result = (|| {
+                let (account, secrets) = horizon_account_sign_in::sign_in(&base, &cancelled, &|url| {
+                    set(SignInState::Browser(url.to_owned()))
+                })?;
+                let progress = |phase| set(SignInState::Working(phase));
+                progress(session::Phase::Queued);
+                let store = store();
+                let _operation = session::lock(store)?;
+                let mut accounts = Accounts::load();
+                accept_sign_in(
+                    &mut accounts,
+                    store,
+                    None,
+                    account.clone(),
+                    &secrets,
+                    &cancelled,
+                    &progress,
+                )?;
+                progress(session::Phase::Saving);
+                accounts.save()?;
+                Ok(account)
+            })();
+            set(SignInState::Done(result));
+        });
+        Self { state, cancel }
     }
 
     fn start_expected(expected: Option<Account>) -> Self {
@@ -2239,7 +2634,8 @@ pub struct GameSession {
 /// for it, and the other accounts' for its splitscreen players.
 pub fn session_for_game(game_home: &Path) -> Result<GameSession, NoOwner> {
     let mut accounts = Accounts::load();
-    let pass = launch_for_game(
+    let provider = accounts.provider();
+    let pass = launch_for_mode(
         &Endpoints::live(),
         client_id().as_deref(),
         store(),
@@ -2249,6 +2645,7 @@ pub fn session_for_game(game_home: &Path) -> Result<GameSession, NoOwner> {
         game_home,
         &mut accounts,
         pass.session.as_ref().map(|(a, _)| a.uuid.as_str()),
+        provider,
     );
     if let Err(e) = accounts.save() {
         eprintln!("Horizon: the accounts are not saved: {e}");
@@ -2262,6 +2659,7 @@ pub fn session_for_game(game_home: &Path) -> Result<GameSession, NoOwner> {
 /// `account select` picked is not touched.
 pub fn session_for_game_as(game_home: &Path, who: &str) -> Result<GameSession, String> {
     let mut accounts = Accounts::load();
+    let provider = accounts.provider();
     let pass = launch_as(
         &Endpoints::live(),
         client_id().as_deref(),
@@ -2277,6 +2675,7 @@ pub fn session_for_game_as(game_home: &Path, who: &str) -> Result<GameSession, S
         game_home,
         &mut accounts,
         pass.session.as_ref().map(|(a, _)| a.uuid.as_str()),
+        provider,
     );
     if let Err(e) = accounts.save() {
         eprintln!("Horizon: the accounts are not saved: {e}");
@@ -2295,7 +2694,7 @@ fn launch_as(
     let chosen = accounts.selected.clone();
     let pass = accounts
         .play_as(who)
-        .and_then(|()| launch_for_game(ep, client_id, store, accounts).map_err(|e| e.to_string()));
+        .and_then(|()| launch_for_mode(ep, client_id, store, accounts).map_err(|e| e.to_string()));
     accounts.selected = chosen;
     pass
 }
@@ -2320,22 +2719,36 @@ fn split_sessions(
     game_home: &Path,
     accounts: &mut Accounts,
     playing: Option<&str>,
+    provider: Provider,
 ) -> Vec<(&'static str, String)> {
     if splitscreen_on(game_home) {
-        // The launch may override the saved player.
-        let selected = std::mem::replace(&mut accounts.selected, playing.map(str::to_owned));
+        let mut shared = sharing(accounts, provider, playing);
         let env = account_sessions(
             &Endpoints::live(),
             client_id().as_deref(),
             store(),
             &game_home.join("sessions"),
-            accounts,
+            &mut shared,
         );
-        accounts.selected = selected;
+        // What the services renewed is kept in the list, in its order.
+        for kept in accounts.accounts.iter_mut() {
+            if let Some(renewed) = shared.accounts.iter().find(|a| a.uuid == kept.uuid) {
+                *kept = renewed.clone();
+            }
+        }
         env
     } else {
         Vec::new()
     }
+}
+
+/// The accounts that share a launch's game (splitscreen): those of the setting's service. The
+/// account the launch plays as is `playing`; `account_sessions` leaves it out.
+fn sharing(accounts: &Accounts, provider: Provider, playing: Option<&str>) -> Accounts {
+    let mut out = accounts.clone();
+    out.accounts.retain(|a| a.provider == provider);
+    out.selected = playing.map(str::to_owned);
+    out
 }
 
 /// Whether the game's Splitscreen setting is on (`horizon-extras.txt`, `splitscreen:true`): only
@@ -2397,12 +2810,13 @@ fn account_sessions_until(
             store,
             Some(deadline.saturating_duration_since(Instant::now())),
         );
-        let Some(secrets) = secrets_in(store, &account.uuid) else {
+        let Some(secrets) = secrets_in(store, &account) else {
             list.push(skipped("Sign in again in the launcher."));
             continue;
         };
         let fallback = skipped("Sign in again in the launcher.");
         let before = serde_json::to_string(&secrets).ok();
+        let key = account.secret_key();
         let uuid = account.uuid.clone();
         // An account the services sent back to sign-in (a refused refresh, a token now for
         // another profile) is never handed over, whatever its token's time says.
@@ -2432,7 +2846,7 @@ fn account_sessions_until(
         // A renewed token, or the services' answer, kept for the next launch.
         let after = serde_json::to_string(&secrets).ok();
         if let (true, Some(text)) = (after != before, after) {
-            let _ = store.set(&uuid, &text);
+            let _ = store.set(&key, &text);
         }
         drop(operation);
         let Some(account) = account else {
@@ -2482,15 +2896,18 @@ fn java_player_with(
     accounts: &mut Accounts,
 ) -> Result<crate::java_launch::Player, String> {
     let pass = launch(ep, client_id, store, accounts).map_err(|e| e.to_string())?;
+    // Vanilla's Java game takes a Microsoft session only. A custom account's token never goes to it.
     let kept = || {
         let order = accounts.selected().into_iter().chain(&accounts.accounts);
         order
             .into_iter()
-            .find_map(|a| Some((a.clone(), secrets_in(store, &a.uuid).filter(|s| s.owns)?)))
+            .filter(|a| a.provider == Provider::Mojang)
+            .find_map(|a| Some((a.clone(), secrets_in(store, a).filter(|s| s.owns)?)))
     };
     let (account, secrets) = pass
         .session
         .or(pass.owner)
+        .filter(|(a, _)| a.provider == Provider::Mojang)
         .or_else(kept)
         .ok_or_else(|| NoOwner::default().to_string())?;
     Ok(crate::java_launch::Player {

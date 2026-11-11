@@ -14,11 +14,21 @@ pub const DEFAULT_DISCOVERY: &str = "https://discovery.minecraftservices.com/min
 /// A session file older than this is refused: it can't be replayed later.
 const MAX_SESSION_FILE_AGE: Duration = Duration::from_secs(120);
 
-/// A signed-in account (vanilla's User with type msa).
+/// Which service signed the account in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provider {
+    /// Microsoft, through Mojang's services (vanilla's `msa` user type).
+    Mojang,
+    /// The Horizon Account Provider at `auth_base_url`: the launcher's Horizon Account Provider choice.
+    HorizonAccount { auth_base_url: String },
+}
+
+/// A signed-in account (vanilla's User with type msa, or a custom service's account).
 pub struct AuthSession {
     pub name: String,
     pub uuid: u128,
     pub xuid: Option<String>,
+    pub provider: Provider,
     access_token: String,
 }
 impl std::fmt::Debug for AuthSession {
@@ -46,14 +56,27 @@ impl AuthSession {
             name: name.to_owned(),
             uuid,
             xuid: None,
+            provider: Provider::Mojang,
             access_token: access_token.to_owned(),
         }
+    }
+
+    /// Whether this session is a Mojang (Microsoft) session.
+    pub fn is_mojang(&self) -> bool {
+        self.provider == Provider::Mojang
+    }
+
+    /// Whether this session is a custom auth service's session.
+    pub fn is_horizon_account(&self) -> bool {
+        matches!(self.provider, Provider::HorizonAccount { .. })
     }
 
     pub fn access_token(&self) -> &str {
         &self.access_token
     }
-    /// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa", "xuid"}.
+    /// The session file's JSON: {"name", "uuid", "access_token", "user_type", "xuid"}. A Microsoft
+    /// session has user_type "msa" or none. A custom session has user_type and provider "horizon_account"
+    /// and an https auth_base_url.
     pub fn parse(text: &str) -> Result<Self, String> {
         let v: serde_json::Value =
             serde_json::from_str(text).map_err(|_| "the session is not valid JSON")?;
@@ -68,13 +91,29 @@ impl AuthSession {
         let access_token = field("access_token")
             .filter(|t| !t.is_empty())
             .ok_or("the session has no access token")?;
-        if field("user_type").is_some_and(|t| t != "msa") {
-            return Err("the session is not a Microsoft account session".into());
-        }
+        let provider = match (field("user_type"), field("provider")) {
+            (None | Some("msa"), None | Some("mojang")) => Provider::Mojang,
+            (Some("horizon_account"), Some("horizon_account")) => {
+                let base = field("auth_base_url")
+                    .filter(|url| url.starts_with("https://"))
+                    .ok_or("the custom session has no https auth_base_url")?;
+                Provider::HorizonAccount {
+                    auth_base_url: base.to_owned(),
+                }
+            }
+            (Some("horizon_account"), _) => {
+                return Err("the custom session's provider is not custom".into());
+            }
+            (None | Some("msa"), _) => {
+                return Err("the session's provider does not match its account type".into());
+            }
+            _ => return Err("the session is not a Microsoft account session".into()),
+        };
         Ok(Self {
             name: name.to_owned(),
             uuid,
             xuid: field("xuid").map(str::to_owned),
+            provider,
             access_token: access_token.to_owned(),
         })
     }
@@ -127,10 +166,17 @@ static CURRENT: OnceLock<Arc<AuthSession>> = OnceLock::new();
 
 /// The account this game was started with (set once at start).
 pub fn set_current(session: AuthSession) {
+    crate::gfx::native_render::native_account_session_started(&session);
     let _ = CURRENT.set(Arc::new(session));
 }
 pub fn current() -> Option<Arc<AuthSession>> {
     CURRENT.get().cloned()
+}
+
+/// The current session when it is a Mojang (Microsoft) session whose token has not expired.
+/// Realms is Mojang-only: a custom account's token never leaves for Mojang's services.
+pub fn mojang_session() -> Option<Arc<AuthSession>> {
+    current().filter(|s| !s.expired() && s.is_mojang())
 }
 
 /// Why joining a server through the session service failed, like the
@@ -203,14 +249,30 @@ pub fn discovery_overridden() -> bool {
     discovery_url() != DEFAULT_DISCOVERY
 }
 
-/// The discovery document, fetched once per game (a failure is retried next time).
-pub(crate) fn discovery() -> Result<Arc<serde_json::Value>, JoinError> {
-    static CACHE: Mutex<Option<Arc<serde_json::Value>>> = Mutex::new(None);
-    if let Some(d) = CACHE.lock().unwrap().clone() {
-        return Ok(d);
+/// Where a service's discovery document is: Mojang's `mojang_url` (see
+/// `discovery_url`), or a custom service's `GET /` at its base URL.
+pub fn discovery_location(provider: &Provider, mojang_url: &str) -> String {
+    match provider {
+        Provider::Mojang => mojang_url.to_owned(),
+        Provider::HorizonAccount { auth_base_url } => {
+            format!("{}/", auth_base_url.trim_end_matches('/'))
+        }
+    }
+}
+
+/// Discovery documents by URL, each fetched once per game (a failure is retried next time).
+static DISCOVERY: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, Arc<serde_json::Value>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The discovery document of `provider`'s service.
+pub(crate) fn discovery_for(provider: &Provider) -> Result<Arc<serde_json::Value>, JoinError> {
+    let url = discovery_location(provider, &discovery_url());
+    if let Some(doc) = DISCOVERY.lock().unwrap().get(&url) {
+        return Ok(doc.clone());
     }
     let doc: serde_json::Value = agent()
-        .get(&discovery_url())
+        .get(&url)
         .call()
         .inspect_err(|e| log::warn!("The services discovery document: {e}"))
         .ok()
@@ -218,8 +280,29 @@ pub(crate) fn discovery() -> Result<Arc<serde_json::Value>, JoinError> {
         .and_then(|t| serde_json::from_str(&t).ok())
         .ok_or(JoinError::Unavailable)?;
     let doc = Arc::new(doc);
-    *CACHE.lock().unwrap() = Some(doc.clone());
+    DISCOVERY.lock().unwrap().insert(url, doc.clone());
     Ok(doc)
+}
+
+/// Mojang's services discovery document: what a caller without a session reads.
+pub(crate) fn discovery() -> Result<Arc<serde_json::Value>, JoinError> {
+    discovery_for(&Provider::Mojang)
+}
+
+/// The discovery document of the account this game runs as (Mojang's without one).
+pub(crate) fn discovery_for_process() -> Result<Arc<serde_json::Value>, JoinError> {
+    match current() {
+        Some(session) => discovery_for(&session.provider),
+        None => discovery(),
+    }
+}
+
+/// The discovery document of the account this game runs as, if it is fetched
+/// already. Never blocks.
+pub fn cached_discovery_for_process() -> Option<Arc<serde_json::Value>> {
+    let provider = current().map_or(Provider::Mojang, |s| s.provider.clone());
+    let url = discovery_location(&provider, &discovery_url());
+    DISCOVERY.lock().unwrap().get(&url).cloned()
 }
 
 /// MinecraftServicesDiscoveryService.getUrl(service, endpoint).
@@ -236,7 +319,7 @@ pub fn endpoint(doc: &serde_json::Value, service: &str, name: &str) -> Option<St
 /// to no actions, as vanilla does. Blocks: call it off the main thread.
 pub fn fetch_account_status(session: &AuthSession) -> crate::ban_notice::AccountStatus {
     use crate::ban_notice::{AccountStatus, parse_profile_actions, parse_properties};
-    let Ok(doc) = discovery() else {
+    let Ok(doc) = discovery_for(&session.provider) else {
         return AccountStatus::default();
     };
     let properties = endpoint(&doc, "player", "getAttributes")
@@ -299,6 +382,14 @@ fn with_one_retry(
 /// account is joining the server whose hash is `server_hash`. Horizon tries
 /// twice when the service doesn't answer; vanilla asks the player to.
 pub fn join_server(session: &AuthSession, server_hash: &str) -> Result<(), JoinError> {
+    let mut answer = None;
+    crate::gfx::native_render::native_account_join(session, server_hash, &mut answer);
+    if let Some(answer) = answer {
+        return answer;
+    }
+    if !session.is_mojang() {
+        return Err(JoinError::Unavailable);
+    }
     with_one_retry(
         || join_server_once(session, server_hash),
         Duration::from_millis(500),
@@ -306,7 +397,7 @@ pub fn join_server(session: &AuthSession, server_hash: &str) -> Result<(), JoinE
 }
 
 fn join_server_once(session: &AuthSession, server_hash: &str) -> Result<(), JoinError> {
-    let doc = discovery()?;
+    let doc = discovery_for(&session.provider)?;
     let url = endpoint(&doc, "session", "join").ok_or(JoinError::Unavailable)?;
     match agent()
         .post(&url)
@@ -428,7 +519,7 @@ pub fn parse_certificates(body: &str) -> Option<ChatKeyPair> {
 /// UserApiService.getKeyPair: the certificates endpoint, POSTed with the
 /// access token.
 pub fn fetch_chat_keys(session: &AuthSession) -> Result<ChatKeyPair, JoinError> {
-    let doc = discovery()?;
+    let doc = discovery_for(&session.provider)?;
     let url = endpoint(&doc, "player", "getCertificates").ok_or(JoinError::Unavailable)?;
     let body = match agent()
         .post(&url)
@@ -532,6 +623,14 @@ const MINECRAFT_PROFILE: &str = "https://api.minecraftservices.com/minecraft/pro
 /// Single-player and integrated servers often send no `textures` property, or
 /// one without the equipped cape; the client asks the profile endpoint once.
 pub fn own_textures(session: &AuthSession) -> Option<crate::skins::Textures> {
+    let mut answer = None;
+    crate::gfx::native_render::native_account_own_textures(session, &mut answer);
+    if answer.is_some() {
+        return answer;
+    }
+    if !session.is_mojang() {
+        return None;
+    }
     let response = agent()
         .get(MINECRAFT_PROFILE)
         .set("Authorization", &format!("Bearer {}", session.access_token))
@@ -771,6 +870,39 @@ mod tests {
     }
 
     #[test]
+    fn custom_session_files_name_their_auth_service() {
+        let s = AuthSession::parse(
+            r#"{"name":"A","uuid":"069a79f444e94726a5befca90e38aaf5","access_token":"t","user_type":"horizon_account","provider":"horizon_account","auth_base_url":"https://auth.example.test"}"#,
+        )
+        .unwrap();
+        assert_eq!((s.name.as_str(), s.uuid), ("A", UUID));
+        assert_eq!(s.access_token(), "t");
+        assert!(
+            matches!(&s.provider, Provider::HorizonAccount { auth_base_url } if auth_base_url == "https://auth.example.test")
+        );
+    }
+
+    #[test]
+    fn custom_session_files_must_name_a_secure_service() {
+        let session = |extra: &str| {
+            format!(
+                r#"{{"name":"A","uuid":"069a79f444e94726a5befca90e38aaf5","access_token":"t",{extra}}}"#
+            )
+        };
+        let refused = [
+            r#""user_type":"horizon_account","auth_base_url":"https://auth.example.test""#,
+            r#""user_type":"horizon_account","provider":"mojang","auth_base_url":"https://auth.example.test""#,
+            r#""user_type":"horizon_account","provider":"horizon_account""#,
+            r#""user_type":"horizon_account","provider":"horizon_account","auth_base_url":"http://auth.example.test""#,
+            r#""user_type":"msa","provider":"horizon_account","auth_base_url":"https://auth.example.test""#,
+            r#""user_type":"legacy","provider":"horizon_account","auth_base_url":"https://auth.example.test""#,
+        ];
+        for extra in refused {
+            assert!(AuthSession::parse(&session(extra)).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
     fn join_request_like_authlib() {
         let s = AuthSession::new("Notch", UUID, "tok");
         let v: serde_json::Value = serde_json::from_str(&join_request(&s, "-7c9d")).unwrap();
@@ -947,5 +1079,119 @@ mod tests {
             Some("https://s/join")
         );
         assert_eq!(endpoint(&doc, "session", "verify"), None);
+    }
+
+    /// A loopback service: `GET /` answers `discovery`, every other request
+    /// answers `status` with `body`. Each request but `GET /` is sent on the
+    /// receiver (its path and body) before the answer.
+    fn serve(
+        listener: std::net::TcpListener,
+        discovery: String,
+        status: u16,
+        body: impl Into<String>,
+    ) -> std::sync::mpsc::Receiver<(String, String)> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let (send, seen) = std::sync::mpsc::channel();
+        let body: String = body.into();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(n) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                }
+                let mut request = vec![0; length];
+                reader.read_exact(&mut request).unwrap();
+                let (code, answer) = if path == "/" {
+                    (200, discovery.clone())
+                } else {
+                    let _ = send.send((path, String::from_utf8(request).unwrap()));
+                    (status, body.clone())
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {code} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                )
+                .unwrap();
+            }
+        });
+        seen
+    }
+
+    /// The discovery document of a service at `base` whose join is its own.
+    fn join_discovery(base: &str) -> String {
+        serde_json::json!({"discovery": {"session": {"endpoints": {
+            "join": {"uri": format!("{base}/sessionserver/session/minecraft/join")}
+        }}}})
+        .to_string()
+    }
+
+    fn horizon_account(base: &str) -> AuthSession {
+        AuthSession {
+            name: "Ann".into(),
+            uuid: UUID,
+            xuid: None,
+            provider: Provider::HorizonAccount {
+                auth_base_url: base.to_owned(),
+            },
+            access_token: "custom-token".into(),
+        }
+    }
+
+    #[test]
+    fn provider_predicates_name_the_session_service() {
+        let mojang = AuthSession::new("Ann", UUID, "not-a-jwt");
+        assert!(mojang.is_mojang());
+        assert!(!mojang.is_horizon_account());
+        let custom = horizon_account("https://auth.example.org");
+        assert!(!custom.is_mojang());
+        assert!(custom.is_horizon_account());
+    }
+
+    #[test]
+    fn a_horizon_account_join_is_refused_without_its_mod() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = serve(listener, join_discovery(&base), 204, "");
+        assert_eq!(
+            join_server(&horizon_account(&base), "5a7f"),
+            Err(JoinError::Unavailable)
+        );
+        assert!(seen.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn a_horizon_account_has_no_own_skin_without_its_mod() {
+        assert!(own_textures(&horizon_account("https://auth.example.test")).is_none());
+    }
+
+    #[test]
+    fn each_provider_names_its_own_discovery_document() {
+        let mojang = "https://discovery.example.test/minecraft/client";
+        assert_eq!(discovery_location(&Provider::Mojang, mojang), mojang);
+        for base in ["https://auth.example.test", "https://auth.example.test/"] {
+            let custom = Provider::HorizonAccount {
+                auth_base_url: base.into(),
+            };
+            assert_eq!(
+                discovery_location(&custom, mojang),
+                "https://auth.example.test/"
+            );
+        }
     }
 }

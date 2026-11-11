@@ -49,7 +49,7 @@ pub(super) fn logo(size: f32) -> Div {
 }
 
 /// The button, in the dark or light form the launcher's look calls for.
-pub(super) fn sign_in_button(id: &'static str, t: &Theme) -> Stateful<Div> {
+pub(super) fn sign_in_button(id: &'static str, t: &Theme, label: &'static str) -> Stateful<Div> {
     let (fill, ink, border) = if t.dark {
         (0x2f2f2f, 0xffffff, None)
     } else {
@@ -76,8 +76,24 @@ pub(super) fn sign_in_button(id: &'static str, t: &Theme) -> Stateful<Div> {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(gpui::rgb(ink))
                 .whitespace_nowrap()
-                .child(tr("Sign in with Microsoft").to_string()),
+                .child(tr(label).to_string()),
         )
+}
+
+/// The sign-in button's words: Microsoft's own only when the sign-in is Microsoft's.
+pub(super) fn sign_in_label(choice: horizon_launcher::account::Authenticate) -> &'static str {
+    match choice {
+        horizon_launcher::account::Authenticate::HorizonAccount => "Sign in",
+        _ => "Sign in with Microsoft",
+    }
+}
+
+/// The account's kind on screen: the service that signed it in.
+pub(super) fn account_kind(provider: horizon_launcher::account::Provider) -> &'static str {
+    match provider {
+        horizon_launcher::account::Provider::Mojang => tr("Microsoft account"),
+        horizon_launcher::account::Provider::HorizonAccount => tr("Horizon Account Provider account"),
+    }
 }
 
 /// How long the logout page gets before the code page opens after it.

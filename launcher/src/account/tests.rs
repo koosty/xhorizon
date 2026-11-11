@@ -19,6 +19,10 @@ struct Mock {
     launcher_login_refused: Option<u16>,
     /// Mojang's session server refuses `join` (the token was revoked since it was renewed).
     join_refused: bool,
+    /// What `authserver/refresh` answers (default: a renewal to `custom-access-2`).
+    refresh: Option<(u16, Value)>,
+    /// What `authserver/signout` answers (default: 204, every token revoked).
+    signout: Option<u16>,
     /// Every request: method, path and body.
     log: Vec<(String, String, String)>,
 }
@@ -144,6 +148,14 @@ fn route(mock: &mut Mock, method: &str, path: &str, auth: &str, body: &str) -> (
             );
             (204, String::new())
         }
+        ("POST", "/mc/authserver/refresh") => match &mock.refresh {
+            Some((status, body)) => reply(*status, body.clone()),
+            None => reply(
+                200,
+                json!({"accessToken": "custom-access-2", "clientToken": "horizon-launcher", "selectedProfile": {"id": CUSTOM_UUID, "name": "Notch"}}),
+            ),
+        },
+        ("POST", "/mc/authserver/signout") => (mock.signout.unwrap_or(204), String::new()),
         _ => reply(404, json!({"error": "NotFound"})),
     }
 }
@@ -231,6 +243,8 @@ fn the_whole_chain() {
     assert_eq!(
         account,
         Account {
+            provider: Provider::Mojang,
+            auth_base_url: None,
             uuid: UUID.into(),
             name: "Notch".into(),
             skin: Some((
@@ -312,6 +326,8 @@ fn login_with_xbox_signs_in_when_launcher_login_refuses() {
 
 fn notch() -> Account {
     Account {
+        provider: Provider::Mojang,
+        auth_base_url: None,
         uuid: UUID.into(),
         name: "Notch".into(),
         skin: None,
@@ -401,7 +417,7 @@ fn nowhere() -> PathBuf {
 }
 
 fn kept(store: &MemoryStore) -> Secrets {
-    secrets_in(store, UUID).unwrap()
+    secrets_in(store, &notch()).unwrap()
 }
 
 #[test]
@@ -409,6 +425,8 @@ fn splitscreen_gets_the_other_accounts_that_still_hold() {
     let store = MemoryStore::default();
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
     let other = |name: &str, uuid: &str| Account {
+        provider: Provider::Mojang,
+        auth_base_url: None,
         uuid: uuid.into(),
         name: name.into(),
         skin: None,
@@ -489,6 +507,8 @@ fn splitscreen_never_hands_over_an_account_sent_back_to_sign_in() {
         ..secrets("other-profile-token", true)
     };
     let eve = Account {
+        provider: Provider::Mojang,
+        auth_base_url: None,
         uuid: "e".into(),
         name: "Eve".into(),
         skin: None,
@@ -667,6 +687,8 @@ fn any_owner_opens_the_gate_and_the_one_who_plays_brings_the_session() {
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
     // A second account, no longer in the keychain, plays.
     accounts.accounts.push(Account {
+        provider: Provider::Mojang,
+        auth_base_url: None,
         uuid: "other".into(),
         name: "Alex".into(),
         skin: None,
@@ -706,6 +728,8 @@ fn the_game_plays_only_as_an_account_that_owns_it() {
     // Another account plays: Notch owning the game doesn't let it play under a name of its own.
     accounts.accounts.push(Account {
         uuid: "other".into(),
+        provider: Provider::Mojang,
+        auth_base_url: None,
         name: "Alex".into(),
         skin: None,
         cape: None,
@@ -808,6 +832,8 @@ fn accounts_keep_secrets_in_the_store_only() {
     let store = MemoryStore::default();
     let mut accounts = Accounts::default();
     let account = Account {
+        provider: Provider::Mojang,
+        auth_base_url: None,
         uuid: UUID.into(),
         name: "Notch".into(),
         skin: None,
@@ -837,6 +863,139 @@ fn accounts_keep_secrets_in_the_store_only() {
         (None, None)
     );
     assert!(!store.persistent());
+}
+
+/// A custom account's UUID, from the service: random, so never a Mojang account's.
+const CUSTOM_UUID: &str = "0b6f0a4e2c9d4f7a8e1b3c5d7f9a2b4c";
+
+fn horizon_account(uuid: &str, name: &str) -> Account {
+    Account {
+        uuid: uuid.into(),
+        name: name.into(),
+        provider: Provider::HorizonAccount,
+        auth_base_url: Some("https://auth.example.net".into()),
+        skin: None,
+        cape: None,
+    }
+}
+
+#[test]
+fn accounts_from_before_providers_load_as_mojang() {
+    // accounts.json as the launcher wrote it before accounts carried a provider.
+    let saved =
+        format!(r#"{{"accounts":[{{"uuid":"{UUID}","name":"Notch"}}],"selected":"{UUID}"}}"#);
+    let accounts: Accounts = serde_json::from_str(&saved).unwrap();
+    let account = accounts.selected().unwrap();
+    assert_eq!(account.provider, Provider::Mojang);
+    assert_eq!(account.auth_base_url, None);
+    let store = MemoryStore::default();
+    store
+        .set(
+            UUID,
+            &serde_json::to_string(&secrets("mc-token", true)).unwrap(),
+        )
+        .unwrap();
+    assert!(accounts.has_owner(&store));
+}
+
+#[test]
+fn custom_accounts_keep_secrets_under_their_own_key() {
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    let custom = horizon_account(CUSTOM_UUID, "Alex");
+    accounts
+        .add(&store, custom.clone(), &secrets("custom-mc-token", true))
+        .unwrap();
+    let saved = serde_json::to_string(&accounts).unwrap();
+    assert!(saved.contains("https://auth.example.net"));
+    assert!(!saved.contains("custom-mc-token"));
+    let custom_secrets = store
+        .get(&format!("horizon_account:{CUSTOM_UUID}"))
+        .unwrap()
+        .unwrap();
+    assert!(custom_secrets.contains("custom-mc-token"));
+    let notch_secrets = store.get(UUID).unwrap().unwrap();
+    assert!(notch_secrets.contains("mc-token") && !notch_secrets.contains("custom-mc-token"));
+    assert_eq!(accounts.find("alex"), Some(&custom));
+}
+
+#[test]
+fn removing_a_custom_account_removes_only_its_secrets() {
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    accounts
+        .add(
+            &store,
+            horizon_account(CUSTOM_UUID, "Alex"),
+            &secrets("custom-mc-token", true),
+        )
+        .unwrap();
+    accounts.remove(&store, CUSTOM_UUID).unwrap();
+    assert_eq!(store.get(&format!("horizon_account:{CUSTOM_UUID}")).unwrap(), None);
+    assert!(store.get(UUID).unwrap().unwrap().contains("mc-token"));
+    assert_eq!(accounts.accounts, vec![notch()]);
+    assert_eq!(accounts.selected(), None);
+}
+
+#[test]
+fn a_custom_account_never_replaces_a_mojang_account_with_its_uuid() {
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    let clash = horizon_account(UUID, "Imposter");
+    assert!(accounts
+        .add(&store, clash, &secrets("custom-mc-token", true))
+        .is_err());
+    assert_eq!(accounts.accounts, vec![notch()]);
+    assert_eq!(accounts.selected(), Some(&notch()));
+    assert_eq!(store.get(&format!("horizon_account:{UUID}")).unwrap(), None);
+}
+
+#[test]
+fn removing_an_account_removes_every_entry_with_its_uuid() {
+    // A hand-edited accounts.json can list one UUID under both services.
+    let store = MemoryStore::default();
+    let custom_key = format!("horizon_account:{UUID}");
+    store
+        .set(
+            UUID,
+            &serde_json::to_string(&secrets("mc-token", true)).unwrap(),
+        )
+        .unwrap();
+    store
+        .set(
+            &custom_key,
+            &serde_json::to_string(&secrets("custom-mc-token", true)).unwrap(),
+        )
+        .unwrap();
+    let mut accounts = Accounts {
+        accounts: vec![notch(), horizon_account(UUID, "Imposter")],
+        selected: Some(UUID.into()),
+        ..Default::default()
+    };
+    accounts.remove(&store, UUID).unwrap();
+    assert_eq!(store.get(UUID).unwrap(), None);
+    assert_eq!(store.get(&custom_key).unwrap(), None);
+    assert!(accounts.accounts.is_empty());
+    assert_eq!(accounts.selected(), None);
+}
+
+#[test]
+fn a_custom_account_with_time_left_is_never_checked_through_mojang() {
+    // The Play check answers from a custom token's secrets alone while it has time left: no
+    // Microsoft, Xbox or Minecraft request, and the account keeps its provider and address.
+    let (m, ep) = mock(|_| {});
+    let custom = custom_signed_in(CUSTOM_BASE);
+    let Check::Owns(account, secrets) = check(
+        &ep,
+        Some("test-client"),
+        &custom,
+        custom_secrets("custom-access-1", 7200),
+    ) else {
+        panic!("a token with time left stays signed in");
+    };
+    assert!(m.lock().unwrap().log.is_empty());
+    assert_eq!(account.provider, Provider::HorizonAccount);
+    assert_eq!(secrets.minecraft_token, "custom-access-1");
 }
 
 /// The OS keychain itself: Credential Manager and the Keychain take one secret per item, and a
@@ -1044,6 +1203,8 @@ fn has_owner_asks_the_selected_account_first() {
         .add(
             &store,
             Account {
+                provider: Provider::Mojang,
+                auth_base_url: None,
                 uuid: "other".into(),
                 name: "Other".into(),
                 skin: None,
@@ -1110,6 +1271,8 @@ fn only_the_typed_macos_removed_executable_failure_gets_the_restart_message() {
 fn session_files_are_private_and_complete() {
     let dir = std::env::temp_dir().join(format!("horizon-launcher-session-{}", std::process::id()));
     let account = Account {
+        provider: Provider::Mojang,
+        auth_base_url: None,
         uuid: UUID.into(),
         name: "Notch".into(),
         skin: None,
@@ -1164,6 +1327,8 @@ fn client_id_is_configuration() {
 fn play_as_picks_a_signed_in_account() {
     let mut a = Accounts {
         accounts: vec![Account {
+            provider: Provider::Mojang,
+            auth_base_url: None,
             uuid: "abc".into(),
             name: "Ludo".into(),
             skin: None,
@@ -1239,7 +1404,7 @@ fn the_secrets_file_keeps_sign_ins_across_starts() {
     accounts.add(&store, notch(), &signed_in).unwrap();
     // The next start reads the same file.
     let again = FileStore::new(path.clone());
-    let read = secrets_in(&again, UUID).expect("kept across starts");
+    let read = secrets_in(&again, &notch()).expect("kept across starts");
     assert_eq!(
         (read.minecraft_token, read.refresh_token, read.owns),
         (signed_in.minecraft_token, signed_in.refresh_token, true)
@@ -2086,13 +2251,16 @@ fn revoked_refresh_is_remembered_until_a_successful_sign_in() {
     assert_eq!(pass.offline.as_deref(), Some(SIGN_IN_AGAIN));
     assert_eq!(m.lock().unwrap().log.len(), requests);
     assert_eq!(
-        session::status(&store, UUID).state,
+        session::status(&store, &notch().secret_key()).state,
         session::State::SignInRequired
     );
     accounts
         .add(&store, notch(), &secrets("new-minecraft", true))
         .unwrap();
-    assert_eq!(session::status(&store, UUID).state, session::State::Ready);
+    assert_eq!(
+        session::status(&store, &notch().secret_key()).state,
+        session::State::Ready
+    );
 }
 
 #[test]
@@ -2127,7 +2295,7 @@ fn a_rotated_microsoft_credential_survives_a_later_service_failure() {
 fn expiry_is_refreshable_and_a_missing_credential_needs_sign_in() {
     let store = MemoryStore::default();
     assert_eq!(
-        session::status(&store, UUID).state,
+        session::status(&store, &notch().secret_key()).state,
         session::State::SignInRequired
     );
     let mut accounts = signed_in(
@@ -2138,7 +2306,7 @@ fn expiry_is_refreshable_and_a_missing_credential_needs_sign_in() {
         },
     );
     assert_eq!(
-        session::status(&store, UUID).state,
+        session::status(&store, &notch().secret_key()).state,
         session::State::NeedsRefresh
     );
     let (_, ep) = mock(|_| {});
@@ -2146,7 +2314,10 @@ fn expiry_is_refreshable_and_a_missing_credential_needs_sign_in() {
         .unwrap()
         .session
         .is_some());
-    assert_eq!(session::status(&store, UUID).state, session::State::Ready);
+    assert_eq!(
+        session::status(&store, &notch().secret_key()).state,
+        session::State::Ready
+    );
 }
 
 #[test]
@@ -2365,6 +2536,8 @@ fn a_launch_as_another_account_leaves_the_selected_one() {
     let mut accounts = signed_in(&store, &secrets("mc-token", true));
     let alex = "0f22b7ed5e3d4a2c9bfe2f6f8f1f6a01";
     accounts.accounts.push(Account {
+        provider: Provider::Mojang,
+        auth_base_url: None,
         uuid: alex.into(),
         name: "Alex".into(),
         skin: None,
@@ -2410,6 +2583,8 @@ fn splitscreen_stops_renewing_other_accounts_once_out_of_time() {
         ..secrets("old", true)
     };
     let cal = Account {
+        provider: Provider::Mojang,
+        auth_base_url: None,
         uuid: "c".into(),
         name: "Cal".into(),
         skin: None,
@@ -2472,4 +2647,532 @@ fn joining_a_service_id_tells_mojangs_session_server() {
         "svc-42",
     );
     assert!(refused.unwrap_err().contains("Sign in again"));
+}
+
+// ----- Custom accounts (ticket 05) -------------------------------------------------------------
+
+const CUSTOM_BASE: &str = "https://auth.example.org";
+
+fn custom_signed_in(base: &str) -> Account {
+    Account {
+        uuid: CUSTOM_UUID.into(),
+        name: "Notch".into(),
+        skin: None,
+        cape: None,
+        provider: Provider::HorizonAccount,
+        auth_base_url: Some(base.into()),
+    }
+}
+
+fn custom_secrets(access: &str, left: u64) -> Secrets {
+    Secrets {
+        refresh_token: String::new(),
+        sign_in_required: false,
+        minecraft_token: access.into(),
+        minecraft_expires_at: now() + left,
+        xuid: None,
+        owns: true,
+    }
+}
+
+#[test]
+fn a_custom_token_close_to_expiry_is_renewed_through_the_service() {
+    let (m, ep) = mock(|_| {});
+    let account = custom_signed_in(CUSTOM_BASE);
+    let url = format!("{}/authserver/refresh", ep.minecraft);
+    let Check::Owns(renewed, secrets) = horizon_account_sign_in::renew(
+        &url,
+        &account,
+        custom_secrets("custom-access-1", 600),
+        false,
+    ) else {
+        panic!("a renewal the service answered");
+    };
+    assert_eq!(secrets.minecraft_token, "custom-access-2");
+    assert!(!secrets.sign_in_required);
+    assert!(secrets.minecraft_expires_at >= now() + horizon_account_sign_in::TOKEN_LIFETIME - 5);
+    // The account list is unchanged: same name, same UUID, same service.
+    assert_eq!(renewed, account);
+    let log = &m.lock().unwrap().log;
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].1, "/mc/authserver/refresh");
+    let body: Value = serde_json::from_str(&log[0].2).unwrap();
+    assert_eq!(body["accessToken"], "custom-access-1");
+}
+
+#[test]
+fn a_custom_token_with_time_left_is_kept_without_asking_the_service() {
+    let (m, ep) = mock(|_| {});
+    let url = format!("{}/authserver/refresh", ep.minecraft);
+    let Check::Owns(_, secrets) = horizon_account_sign_in::renew(
+        &url,
+        &custom_signed_in(CUSTOM_BASE),
+        custom_secrets("custom-access-1", 7200),
+        false,
+    ) else {
+        panic!("a token with time left stays signed in");
+    };
+    assert_eq!(secrets.minecraft_token, "custom-access-1");
+    assert!(m.lock().unwrap().log.is_empty());
+}
+
+#[test]
+fn a_token_the_service_no_longer_knows_asks_for_a_sign_in() {
+    let (_m, ep) = mock(|m| {
+        m.refresh = Some((
+            403,
+            json!({"error": "ForbiddenOperationException", "errorMessage": "Invalid token."}),
+        ))
+    });
+    let url = format!("{}/authserver/refresh", ep.minecraft);
+    let Check::NoAnswer(message, secrets) = horizon_account_sign_in::renew(
+        &url,
+        &custom_signed_in(CUSTOM_BASE),
+        custom_secrets("custom-access-1", 600),
+        false,
+    ) else {
+        panic!("an expired token is refused");
+    };
+    assert_eq!(message, horizon_account_sign_in::HORIZON_ACCOUNT_SIGN_IN_AGAIN);
+    assert!(secrets.sign_in_required);
+    assert_eq!(secrets.minecraft_token, "custom-access-1");
+}
+
+#[test]
+fn an_outage_keeps_the_token_and_is_not_a_sign_in_request() {
+    let (_m, ep) = mock(|m| m.refresh = Some((503, json!({"error": "ServiceUnavailable"}))));
+    let url = format!("{}/authserver/refresh", ep.minecraft);
+    let Check::NoAnswer(message, secrets) = horizon_account_sign_in::renew(
+        &url,
+        &custom_signed_in(CUSTOM_BASE),
+        custom_secrets("custom-access-1", 600),
+        false,
+    ) else {
+        panic!("an outage is no answer");
+    };
+    assert_eq!(message, horizon_account_sign_in::UNAVAILABLE);
+    assert!(!secrets.sign_in_required);
+    assert_eq!(secrets.minecraft_token, "custom-access-1");
+}
+
+#[test]
+fn a_renewal_for_another_profile_asks_for_a_sign_in() {
+    let (_m, ep) = mock(|m| {
+        m.refresh = Some((
+            200,
+            json!({"accessToken": "custom-access-2", "selectedProfile": {"id": UUID, "name": "Other"}}),
+        ))
+    });
+    let url = format!("{}/authserver/refresh", ep.minecraft);
+    let Check::NoAnswer(_, secrets) = horizon_account_sign_in::renew(
+        &url,
+        &custom_signed_in(CUSTOM_BASE),
+        custom_secrets("custom-access-1", 600),
+        false,
+    ) else {
+        panic!("a profile that is not the account's is refused");
+    };
+    assert!(secrets.sign_in_required);
+    assert_eq!(secrets.minecraft_token, "custom-access-1");
+}
+
+#[test]
+fn a_custom_account_on_plain_http_is_refused_without_contacting_it() {
+    let (m, ep) = mock(|_| {});
+    let Check::NoAnswer(_, secrets) = horizon_account_sign_in::check(
+        &custom_signed_in(&ep.minecraft),
+        custom_secrets("custom-access-1", 600),
+        true,
+    ) else {
+        panic!("a plain http service is refused");
+    };
+    assert_eq!(secrets.minecraft_token, "custom-access-1");
+    assert!(m.lock().unwrap().log.is_empty());
+}
+
+#[test]
+fn a_custom_session_file_names_its_service_and_account_type() {
+    let dir = std::env::temp_dir().join(format!(
+        "horizon-launcher-custom-session-{}",
+        std::process::id()
+    ));
+    let path = write_session_file(
+        &dir,
+        &custom_signed_in(CUSTOM_BASE),
+        &custom_secrets("custom-access-2", 60),
+    )
+    .unwrap();
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    // The game reads these: the account type, the provider and the service's address.
+    assert_eq!(v["user_type"], "horizon_account");
+    assert_eq!(v["provider"], "horizon_account");
+    assert_eq!(v["auth_base_url"], CUSTOM_BASE);
+    assert_eq!(
+        (v["name"].as_str(), v["uuid"].as_str()),
+        (Some("Notch"), Some(CUSTOM_UUID))
+    );
+    assert_eq!(v["access_token"], "custom-access-2");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_custom_account_alone_is_no_player_for_vanilla_java() {
+    // Vanilla's Java game takes a Microsoft session. With only a custom account signed in, the
+    // Java launch has no player at all: the custom token never reaches it.
+    let store = MemoryStore::default();
+    let custom = custom_signed_in(CUSTOM_BASE);
+    store
+        .set(
+            &custom.secret_key(),
+            &serde_json::to_string(&custom_secrets("custom-access-1", 7200)).unwrap(),
+        )
+        .unwrap();
+    let (_m, ep) = mock(|_| {});
+    let mut accounts = Accounts {
+        accounts: vec![custom.clone()],
+        selected: Some(CUSTOM_UUID.into()),
+        ..Default::default()
+    };
+    assert!(java_player_with(&ep, Some("test-client"), &store, &mut accounts).is_err());
+}
+
+/// A custom account signed in with `token`, its secrets in `store`, as the only account listed.
+fn horizon_accounts(store: &MemoryStore, token: &str) -> Accounts {
+    let custom = custom_signed_in(CUSTOM_BASE);
+    store
+        .set(
+            &custom.secret_key(),
+            &serde_json::to_string(&custom_secrets(token, 7200)).unwrap(),
+        )
+        .unwrap();
+    Accounts {
+        accounts: vec![custom],
+        selected: Some(CUSTOM_UUID.into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_custom_sign_out_revokes_with_the_held_token_then_removes_the_local_copy() {
+    let store = MemoryStore::default();
+    let mut accounts = horizon_accounts(&store, "custom-access-1");
+    let calls = std::cell::RefCell::new(Vec::new());
+    let unconfirmed = accounts
+        .sign_out_with(&store, CUSTOM_UUID, &|account, token| {
+            calls
+                .borrow_mut()
+                .push((account.uuid.clone(), token.to_string()));
+            true
+        })
+        .unwrap();
+    assert_eq!(unconfirmed, None);
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [(CUSTOM_UUID.to_string(), "custom-access-1".to_string())]
+    );
+    assert!(store
+        .get(&format!("horizon_account:{CUSTOM_UUID}"))
+        .unwrap()
+        .is_none());
+    assert!(accounts.find(CUSTOM_UUID).is_none());
+    assert!(accounts.selected.is_none());
+}
+
+#[test]
+fn a_custom_sign_out_the_service_does_not_confirm_still_removes_the_local_copy() {
+    let store = MemoryStore::default();
+    let mut accounts = horizon_accounts(&store, "custom-access-1");
+    let unconfirmed = accounts
+        .sign_out_with(&store, CUSTOM_UUID, &|_, _| false)
+        .unwrap();
+    assert_eq!(
+        unconfirmed.as_deref(),
+        Some(horizon_account_sign_in::SIGN_OUT_UNCONFIRMED)
+    );
+    assert!(store
+        .get(&format!("horizon_account:{CUSTOM_UUID}"))
+        .unwrap()
+        .is_none());
+    assert!(accounts.find(CUSTOM_UUID).is_none());
+}
+
+#[test]
+fn a_custom_sign_out_without_a_held_token_is_not_sent_and_not_confirmed() {
+    let store = MemoryStore::default();
+    let mut accounts = Accounts {
+        accounts: vec![custom_signed_in(CUSTOM_BASE)],
+        selected: Some(CUSTOM_UUID.into()),
+        ..Default::default()
+    };
+    let unconfirmed = accounts
+        .sign_out_with(&store, CUSTOM_UUID, &|_, _| panic!("no token to send"))
+        .unwrap();
+    assert_eq!(
+        unconfirmed.as_deref(),
+        Some(horizon_account_sign_in::SIGN_OUT_UNCONFIRMED)
+    );
+    assert!(accounts.find(CUSTOM_UUID).is_none());
+}
+
+#[test]
+fn a_mojang_sign_out_never_calls_the_service() {
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("old-minecraft", true));
+    let calls = std::cell::Cell::new(0);
+    let unconfirmed = accounts
+        .sign_out_with(&store, UUID, &|_, _| {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .unwrap();
+    assert_eq!((unconfirmed, calls.get()), (None, 0));
+    assert!(store.get(UUID).unwrap().is_none());
+    assert!(accounts.find(UUID).is_none());
+}
+
+#[test]
+fn only_a_204_from_the_service_confirms_a_custom_sign_out() {
+    let (m, ep) = mock(|_| {});
+    let url = format!("{}/authserver/signout", ep.minecraft);
+    assert!(horizon_account_sign_in::revoke(&url, "custom-access-1"));
+    {
+        let log = m.lock().unwrap().log.clone();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].1, "/mc/authserver/signout");
+        let body: Value = serde_json::from_str(&log[0].2).unwrap();
+        assert_eq!(body["accessToken"], "custom-access-1");
+    }
+    m.lock().unwrap().signout = Some(403);
+    assert!(!horizon_account_sign_in::revoke(&url, "custom-access-1"));
+}
+
+#[test]
+fn a_custom_sign_out_over_plain_http_is_never_sent() {
+    let (m, ep) = mock(|_| {});
+    assert!(!horizon_account_sign_in::revoke_account(
+        &custom_signed_in(&ep.minecraft),
+        "custom-access-1"
+    ));
+    assert!(m.lock().unwrap().log.is_empty());
+}
+
+/// A keychain that holds secrets but refuses every delete.
+struct RefusesDelete(MemoryStore);
+impl SecretStore for RefusesDelete {
+    fn get(&self, key: &str) -> Result<Option<String>, String> {
+        self.0.get(key)
+    }
+    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+        self.0.set(key, value)
+    }
+    fn delete(&self, _: &str) -> Result<(), String> {
+        Err("the keychain refused the delete".into())
+    }
+    fn persistent(&self) -> bool {
+        true
+    }
+    fn operations(&self) -> &Mutex<()> {
+        self.0.operations()
+    }
+}
+
+#[test]
+fn a_custom_sign_out_the_keychain_refuses_still_revokes_and_reports_the_failure() {
+    let store = RefusesDelete(MemoryStore::default());
+    let mut accounts = horizon_accounts(&store.0, "custom-access-1");
+    let calls = std::cell::Cell::new(0);
+    let result = accounts.sign_out_with(&store, CUSTOM_UUID, &|_, token| {
+        assert_eq!(token, "custom-access-1");
+        calls.set(calls.get() + 1);
+        true
+    });
+    assert!(result.is_err());
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn the_owner_gate_never_counts_a_custom_account() {
+    let store = MemoryStore::default();
+    let mut accounts = Accounts::default();
+    accounts
+        .add(
+            &store,
+            custom_signed_in(CUSTOM_BASE),
+            &custom_secrets("custom-access-1", 7200),
+        )
+        .unwrap();
+    assert!(!accounts.has_owner(&store));
+    let (m, ep) = mock(|_| {});
+    assert_eq!(
+        launch_for_game(&ep, Some("test-client"), &store, &mut accounts).unwrap_err(),
+        NoOwner::default()
+    );
+    assert!(m.lock().unwrap().log.is_empty());
+}
+
+#[test]
+fn horizon_account_mode_plays_as_the_custom_account_and_asks_no_one_else() {
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    accounts
+        .add(
+            &store,
+            custom_signed_in(CUSTOM_BASE),
+            &custom_secrets("custom-access-1", 7200),
+        )
+        .unwrap();
+    // The Mojang account is the one the list selected; Custom URL plays the custom one anyway.
+    accounts.selected = Some(UUID.into());
+    let (m, ep) = mock(|_| {});
+    accounts.mode = Authenticate::HorizonAccount;
+    let pass = launch_for_mode(&ep, Some("test-client"), &store, &mut accounts).unwrap();
+    let (account, session) = pass.session.unwrap();
+    assert_eq!(
+        (account.uuid.as_str(), session.minecraft_token.as_str()),
+        (CUSTOM_UUID, "custom-access-1")
+    );
+    assert!(m.lock().unwrap().log.is_empty());
+}
+
+#[test]
+fn horizon_account_mode_without_a_custom_account_is_refused_without_asking() {
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    let (m, ep) = mock(|_| {});
+    accounts.mode = Authenticate::HorizonAccount;
+    let refused = launch_for_mode(&ep, Some("test-client"), &store, &mut accounts);
+    assert_eq!(
+        refused.unwrap_err(),
+        NoOwner {
+            keyring: Some(NEEDS_HORIZON_ACCOUNT.into())
+        }
+    );
+    assert!(m.lock().unwrap().log.is_empty());
+}
+
+#[test]
+fn mojang_mode_never_plays_as_a_custom_account() {
+    let store = MemoryStore::default();
+    let mut accounts = Accounts::default();
+    accounts
+        .add(
+            &store,
+            custom_signed_in(CUSTOM_BASE),
+            &custom_secrets("custom-access-1", 7200),
+        )
+        .unwrap();
+    let (m, ep) = mock(|_| {});
+    accounts.mode = Authenticate::Mojang;
+    let refused = launch_for_mode(&ep, Some("test-client"), &store, &mut accounts);
+    assert_eq!(refused.unwrap_err(), NoOwner::default());
+    assert!(m.lock().unwrap().log.is_empty());
+}
+
+#[test]
+fn switching_the_setting_moves_the_player_to_its_provider() {
+    use super::Authenticate;
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    accounts
+        .add(
+            &store,
+            custom_signed_in(CUSTOM_BASE),
+            &custom_secrets("custom-access-1", 7200),
+        )
+        .unwrap();
+    accounts.follow(Authenticate::Mojang);
+    assert_eq!(accounts.selected().unwrap().uuid, UUID);
+    accounts.follow(Authenticate::HorizonAccount);
+    assert_eq!(accounts.selected().unwrap().uuid, CUSTOM_UUID);
+    // Both accounts stay in the list, unused by the other setting.
+    assert_eq!(accounts.accounts.len(), 2);
+}
+
+#[test]
+fn the_gate_follows_the_setting() {
+    use super::Authenticate;
+    let store = MemoryStore::default();
+    let mut accounts = Accounts::default();
+    assert!(!{
+        accounts.mode = Authenticate::Mojang;
+        accounts.can_play(&store)
+    });
+    assert!(!{
+        accounts.mode = Authenticate::HorizonAccount;
+        accounts.can_play(&store)
+    });
+    accounts
+        .add(
+            &store,
+            custom_signed_in(CUSTOM_BASE),
+            &custom_secrets("custom-access-1", 7200),
+        )
+        .unwrap();
+    assert!({
+        accounts.mode = Authenticate::HorizonAccount;
+        accounts.can_play(&store)
+    });
+    assert!(!{
+        accounts.mode = Authenticate::Mojang;
+        accounts.can_play(&store)
+    });
+}
+
+#[test]
+fn splitscreen_shares_only_the_accounts_of_the_setting() {
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    accounts
+        .add(
+            &store,
+            custom_signed_in(CUSTOM_BASE),
+            &custom_secrets("custom-access-1", 7200),
+        )
+        .unwrap();
+    let names = |a: &Accounts| {
+        a.accounts
+            .iter()
+            .map(|x| x.uuid.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(&sharing(&accounts, Provider::Mojang, None)),
+        [UUID]
+    );
+    assert_eq!(
+        names(&sharing(&accounts, Provider::HorizonAccount, None)),
+        [CUSTOM_UUID]
+    );
+}
+
+#[test]
+fn a_custom_account_without_its_keychain_secret_is_no_owner() {
+    let store = MemoryStore::default();
+    let mut accounts = Accounts::default();
+    accounts
+        .add(
+            &store,
+            custom_signed_in(CUSTOM_BASE),
+            &custom_secrets("custom-access-1", 7200),
+        )
+        .unwrap();
+    store
+        .delete(&custom_signed_in(CUSTOM_BASE).secret_key())
+        .unwrap();
+    assert!(!{
+        accounts.mode = Authenticate::HorizonAccount;
+        accounts.can_play(&store)
+    });
+}
+
+#[test]
+fn play_as_for_refuses_an_account_of_the_other_service() {
+    let store = MemoryStore::default();
+    let mut accounts = signed_in(&store, &secrets("mc-token", true));
+    accounts.mode = Authenticate::HorizonAccount;
+    let refused = accounts.play_as(UUID);
+    assert_eq!(refused.unwrap_err(), NOT_THIS_SERVICE);
+    assert_eq!(accounts.selected.as_deref(), Some(UUID));
+    accounts.mode = Authenticate::Mojang;
+    accounts.play_as(UUID).unwrap();
 }

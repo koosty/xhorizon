@@ -1,0 +1,17 @@
+{
+  "hooks": [
+    {
+      "name": "account_own_textures",
+      "target": "horizon_client_render::gfx::native_render::native_account_own_textures",
+      "side": "client",
+      "cancellable": false,
+      "mod_api": {
+        "contract": "replace",
+        "out": "answer"
+      }
+    }
+  ],
+  "rust_summary": "an account's own skin and cape, answered by a mod before the profile endpoint is asked (`native_account_own_textures`).",
+  "doc_summary": "`native_account_own_textures(session, answer)` runs before the game reads the signed-in account's skin and cape from Mojang's profile endpoint: the first mod to answer sets `answer`. Bundles need \"hooks\": @API:account_own_textures@.",
+  "comments": ["crates/horizon-client-render/src/gfx/native_render.rs"]
+}

@@ -157,10 +157,11 @@ pub struct RestoreTask {
     abort: Arc<AtomicBool>,
 }
 
-/// The account Realms may use: the launcher's Microsoft session (it hands one over only for
-/// an account that owns the game) while its token is good.
+/// The account Realms may use: the launcher's Microsoft session while its token is good,
+/// via the auth module's Mojang-only answer. A custom account's token never reaches
+/// Mojang's Realms service.
 fn session() -> Option<Arc<AuthSession>> {
-    auth::current().filter(|s| !s.expired())
+    auth::mojang_session()
 }
 
 fn client() -> Option<RealmsClient> {
@@ -1886,7 +1887,7 @@ impl Screen {
             };
             profile.textures()?
         };
-        let textures = crate::skins::unpack(&value, signature, crate::skins::texture_uris());
+        let textures = crate::skins::unpack(&value, signature, &crate::skins::texture_uris()[..]);
         let url = textures.skin?;
         let location = crate::skins::skin_location(&crate::skins::texture_hash(&url)?);
         let mut downloads = self.skin_workers.downloads.lock().ok()?;

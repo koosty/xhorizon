@@ -3179,7 +3179,14 @@ pub fn client_as(tag: &str, who: Option<&str>) -> Result<Command, String> {
         return Err(error);
     }
     play_step("reading the sign-in");
-    let hint = |refused: String| format!("{refused} {}", crate::i18n::tr(SIGN_IN_HINT));
+    let mojang = Settings::load().authenticate_with == crate::account::Authenticate::Mojang;
+    let hint = |refused: String| {
+        if mojang {
+            format!("{refused} {}", crate::i18n::tr(SIGN_IN_HINT))
+        } else {
+            refused
+        }
+    };
     let session = match who {
         None => account::session_for_game(&game_home()).map_err(|refused| {
             // A keyring that didn't answer isn't a missing sign-in (#12179).
@@ -4228,7 +4235,7 @@ pub enum Msg {
     AccountStatus(String, u64, crate::account::session::Status),
     AccountProgress(String, u64, crate::account::session::Phase),
     AccountHead(String, Option<String>, Option<Vec<[u8; 4]>>, bool),
-    AccountRemoved(String, u64, Result<bool, String>),
+    AccountRemoved(String, u64, Result<(bool, Option<String>), String>),
     /// The owner gate's answer for the game about to start: the selected account's session
     /// file (none = offline) and why it plays offline, if it does.
     Session(Result<crate::account::GameSession, crate::account::NoOwner>),
@@ -4511,6 +4518,17 @@ pub struct Settings {
     /// An older file's switch for the release profile, read when `native_profile` is unset.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub native_release: bool,
+    /// Which service signs the player in, read at each Play (`account::Authenticate`).
+    /// Mojang by default; an unknown value from a newer launcher reads as Mojang.
+    #[serde(default)]
+    pub authenticate_with: crate::account::Authenticate,
+    /// The Horizon Account Provider's address, under Horizon Account Provider URL (`account::horizon_account_host`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon_account_url: Option<String>,
+    /// The Horizon Account Provider address the player has trusted. The window warns while the address differs
+    /// from it (`account::warn_about_address`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon_account_trusted: Option<String>,
 }
 
 impl Settings {
@@ -4534,6 +4552,11 @@ impl Settings {
                 .is_some_and(|w| serde_json::from_value::<WhilePlaying>(w.clone()).is_err())
             {
                 fields.remove("while_playing");
+            }
+            if fields.get("authenticate_with").is_some_and(|a| {
+                serde_json::from_value::<crate::account::Authenticate>(a.clone()).is_err()
+            }) {
+                fields.remove("authenticate_with");
             }
             if fields
                 .get("game_architecture")
@@ -4776,8 +4799,8 @@ mod tests {
     }
 
     /// The launcher downloads Mojang's game files (client jar, libraries, assets) only for an
-    /// account the services said owns the game: never without one, and never past the gate by
-    /// the developer option (`Settings::dev_offline`), whose pass has no owner.
+    /// account the services said owns the game: never without one, and never for a refused or
+    /// signed-out pass.
     #[test]
     fn mojang_downloads_only_for_an_owner() {
         let dir = std::env::temp_dir().join(format!("horizon-owner-only-{}", std::process::id()));
@@ -4808,6 +4831,8 @@ mod tests {
         // An owner: Mojang is asked (and the download fails here, without network).
         let owner = account::Account {
             uuid: "069a79f444e94726a5befca90e38aaf5".into(),
+            provider: account::Provider::Mojang,
+            auth_base_url: None,
             name: "Notch".into(),
             skin: None,
             cape: None,

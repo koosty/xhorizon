@@ -5126,8 +5126,11 @@ impl Game<'_> {
                                     } else {
                                         Signature::Unsigned
                                     };
-                                    let textures =
-                                        skins::unpack(&t.value, signature, skins::texture_uris());
+                                    let textures = skins::unpack(
+                                        &t.value,
+                                        signature,
+                                        &skins::texture_uris()[..],
+                                    );
                                     r.skin_textures.entry(e.uuid).or_insert(textures);
                                 }
                             }
@@ -5797,7 +5800,7 @@ impl Game<'_> {
                     horizon_client::skins::unpack(
                         &t.value,
                         signature,
-                        horizon_client::skins::texture_uris(),
+                        &horizon_client::skins::texture_uris()[..],
                     )
                 } else {
                     // `ResolvableProfile.resolveProfile`: no `textures` and
@@ -5815,7 +5818,7 @@ impl Game<'_> {
                                 horizon_client::skins::unpack(
                                     &value,
                                     signature,
-                                    horizon_client::skins::texture_uris(),
+                                    &horizon_client::skins::texture_uris()[..],
                                 )
                             })
                         }

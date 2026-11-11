@@ -180,6 +180,46 @@ pub fn render_needs() -> RenderNeeds {
     needs
 }
 
+/// The account this game runs as is set (`set_current`). A mod may read it here; the game writes
+/// nothing back. API @API:account_session_started@.
+#[inline(never)]
+pub fn native_account_session_started(session: &crate::auth::AuthSession) {
+    generated::dispatch_account_session_started(RENDERERS.get().map_or(&[], |r| r), session);
+}
+
+/// An account's server join, asked of a mod before `join_server` asks its session service. The first
+/// mod to answer writes `answer`. API @API:account_join@.
+#[inline(never)]
+pub fn native_account_join(
+    session: &crate::auth::AuthSession,
+    server_hash: &str,
+    answer: &mut Option<Result<(), crate::auth::JoinError>>,
+) {
+    generated::dispatch_account_join(
+        RENDERERS.get().map_or(&[], |r| r),
+        session,
+        server_hash,
+        answer,
+    );
+}
+
+/// The account's own skin and cape, asked of a mod before Mojang's profile endpoint. The first mod
+/// to answer writes `answer`. API @API:account_own_textures@.
+#[inline(never)]
+pub fn native_account_own_textures(
+    session: &crate::auth::AuthSession,
+    answer: &mut Option<crate::skins::Textures>,
+) {
+    generated::dispatch_account_own_textures(RENDERERS.get().map_or(&[], |r| r), session, answer);
+}
+
+/// The texture URL templates a mod may answer, before the game's own list. The first mod to answer
+/// writes `uris`. API @API:account_texture_uris@.
+#[inline(never)]
+pub fn native_account_texture_uris(uris: &mut Option<Vec<String>>) {
+    generated::dispatch_account_texture_uris(RENDERERS.get().map_or(&[], |r| r), uris);
+}
+
 /// A world warp ([`native_world_warp`]): WGSL that every terrain vertex (far terrain's tiles too)
 /// and entity vertex goes through, so a mod can bend the drawn world itself: its real geometry,
 /// light and depth, seen from any side. docs/native-mods.md, "World warps", has the WGSL contract.

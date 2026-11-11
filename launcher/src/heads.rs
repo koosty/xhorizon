@@ -262,6 +262,8 @@ mod tests {
         let mut account = crate::account::Account {
             name: "TestPlayer".into(),
             uuid: "00000000000000000000000000000000".into(),
+            provider: crate::account::Provider::Mojang,
+            auth_base_url: None,
             skin: Some((
                 "https://textures.minecraft.net/texture/abc".into(),
                 "classic".into(),
@@ -331,6 +333,8 @@ mod tests {
             }
         };
         let account = crate::account::Account {
+            provider: crate::account::Provider::Mojang,
+            auth_base_url: None,
             name: "Notch".into(),
             uuid: uuid.into(),
             skin: None,
@@ -363,6 +367,8 @@ mod tests {
         skin.put_pixel(8, 8, image::Rgba([3, 5, 7, 255]));
         skin.save(&path).unwrap();
         let account = crate::account::Account {
+            provider: crate::account::Provider::Mojang,
+            auth_base_url: None,
             name: "TestPlayer".into(),
             uuid: "00000000000000000000000000000000".into(),
             skin: Some((

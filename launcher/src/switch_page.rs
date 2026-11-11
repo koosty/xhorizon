@@ -1,12 +1,12 @@
 //! Who plays: the top bar's quick switch (a menu under the account chip) between the signed-in
-//! Microsoft accounts.
+//! accounts of the active service.
 use super::*;
 
 impl Launcher {
     /// The chip's two lines: the name that plays, and how.
     pub(super) fn who_plays(&self) -> (String, &'static str) {
         match self.accounts.selected() {
-            Some(a) => (a.name.clone(), tr("Microsoft account")),
+            Some(a) => (a.name.clone(), microsoft::account_kind(a.provider)),
             None => (String::new(), tr("Sign in with Microsoft")),
         }
     }
@@ -21,12 +21,20 @@ impl Launcher {
         self.account_menu = false;
     }
 
-    /// Everyone the player can play as (each account's UUID and name), with how each signs in.
+    /// Everyone the player can play as, of the active service (the account's UUID and name), with how each signs in.
     pub(super) fn players(&self) -> Vec<(String, String, &'static str)> {
+        let provider = self.accounts.provider();
         self.accounts
             .accounts
             .iter()
-            .map(|a| (a.uuid.clone(), a.name.clone(), tr("Microsoft")))
+            .filter(|a| a.provider == provider)
+            .map(|a| {
+                let label = match a.provider {
+                    account::Provider::Mojang => tr("Microsoft"),
+                    account::Provider::HorizonAccount => tr("Horizon Account Provider account"),
+                };
+                (a.uuid.clone(), a.name.clone(), label)
+            })
             .collect()
     }
 

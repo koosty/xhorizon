@@ -24,6 +24,41 @@ pub trait RenderHooks: Send + Sync {
     fn world_warp(&self, event: &mut WorldWarpEvent<'_>) {
         let _ = event;
     }
+    /// An account's server join, asked of a mod before `join_server` asks its session service. The first
+    /// mod to answer writes `answer`. API @API:account_join@.
+    ///
+    /// Return `Some` to set `answer`; the first mod returning `Some` wins.
+    fn account_join(
+        &self,
+        event: &mut AccountJoinEvent<'_>,
+    ) -> Option<Result<(), crate::auth::JoinError>> {
+        let _ = event;
+        None
+    }
+    /// The account's own skin and cape, asked of a mod before Mojang's profile endpoint. The first mod
+    /// to answer writes `answer`. API @API:account_own_textures@.
+    ///
+    /// Return `Some` to set `answer`; the first mod returning `Some` wins.
+    fn account_own_textures(
+        &self,
+        event: &mut AccountOwnTexturesEvent<'_>,
+    ) -> Option<crate::skins::Textures> {
+        let _ = event;
+        None
+    }
+    /// The account this game runs as is set (`set_current`). A mod may read it here; the game writes
+    /// nothing back. API @API:account_session_started@.
+    fn account_session_started(&self, event: &mut AccountSessionStartedEvent<'_>) {
+        let _ = event;
+    }
+    /// The texture URL templates a mod may answer, before the game's own list. The first mod to answer
+    /// writes `uris`. API @API:account_texture_uris@.
+    ///
+    /// Return `Some` to set `uris`; the first mod returning `Some` wins.
+    fn account_texture_uris(&self, event: &mut AccountTextureUrisEvent) -> Option<Vec<String>> {
+        let _ = event;
+        None
+    }
 }
 /// What [`RenderHooks::world_drawn`] is told. Fields may be added: the struct is `#[non_exhaustive]`.
 #[non_exhaustive]
@@ -67,5 +102,81 @@ pub fn dispatch_world_warp(mods: &[&dyn RenderHooks], warp: &mut WorldWarp) {
     let mut event = WorldWarpEvent { warp };
     for mod_hook in mods {
         mod_hook.world_warp(&mut event);
+    }
+}
+/// What [`RenderHooks::account_join`] is told. Fields may be added: the struct is `#[non_exhaustive]`.
+#[non_exhaustive]
+pub struct AccountJoinEvent<'a> {
+    pub session: &'a crate::auth::AuthSession,
+    pub server_hash: &'a str,
+}
+pub fn dispatch_account_join(
+    mods: &[&dyn RenderHooks],
+    session: &crate::auth::AuthSession,
+    server_hash: &str,
+    answer: &mut Option<Result<(), crate::auth::JoinError>>,
+) {
+    if answer.is_some() {
+        return;
+    }
+    let mut event = AccountJoinEvent {
+        session,
+        server_hash,
+    };
+    for mod_hook in mods {
+        if let Some(replacement) = mod_hook.account_join(&mut event) {
+            *answer = Some(replacement);
+            break;
+        }
+    }
+}
+/// What [`RenderHooks::account_own_textures`] is told. Fields may be added: the struct is `#[non_exhaustive]`.
+#[non_exhaustive]
+pub struct AccountOwnTexturesEvent<'a> {
+    pub session: &'a crate::auth::AuthSession,
+}
+pub fn dispatch_account_own_textures(
+    mods: &[&dyn RenderHooks],
+    session: &crate::auth::AuthSession,
+    answer: &mut Option<crate::skins::Textures>,
+) {
+    if answer.is_some() {
+        return;
+    }
+    let mut event = AccountOwnTexturesEvent { session };
+    for mod_hook in mods {
+        if let Some(replacement) = mod_hook.account_own_textures(&mut event) {
+            *answer = Some(replacement);
+            break;
+        }
+    }
+}
+/// What [`RenderHooks::account_session_started`] is told. Fields may be added: the struct is `#[non_exhaustive]`.
+#[non_exhaustive]
+pub struct AccountSessionStartedEvent<'a> {
+    pub session: &'a crate::auth::AuthSession,
+}
+pub fn dispatch_account_session_started(
+    mods: &[&dyn RenderHooks],
+    session: &crate::auth::AuthSession,
+) {
+    let mut event = AccountSessionStartedEvent { session };
+    for mod_hook in mods {
+        mod_hook.account_session_started(&mut event);
+    }
+}
+/// What [`RenderHooks::account_texture_uris`] is told. Fields may be added: the struct is `#[non_exhaustive]`.
+#[non_exhaustive]
+pub struct AccountTextureUrisEvent {}
+pub fn dispatch_account_texture_uris(mods: &[&dyn RenderHooks], uris: &mut Option<Vec<String>>) {
+    if uris.is_some() {
+        return;
+    }
+    let mut event = AccountTextureUrisEvent {};
+    for mod_hook in mods {
+        if let Some(replacement) = mod_hook.account_texture_uris(&mut event) {
+            *uris = Some(replacement);
+            break;
+        }
     }
 }

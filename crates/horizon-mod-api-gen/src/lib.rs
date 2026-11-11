@@ -726,7 +726,10 @@ fn render_hooks_current(root: &Path, render: &str) -> Result<(), String> {
             .map(|file| file.into_token_stream().to_string())
             .map_err(|e| format!("{}: {e}", path.display()))
     };
-    if tokens(&committed)? == tokens(render)? {
+    // The committed file is `rustfmt(render)` (`fill_hooks`), and rustfmt may add a trailing comma
+    // to a signature it breaks over lines: compare what the writer writes, not the raw text.
+    let formatted = String::from_utf8(rustfmt(render)?).map_err(|e| e.to_string())?;
+    if tokens(&committed)? == tokens(&formatted)? {
         Ok(())
     } else {
         Err(format!(

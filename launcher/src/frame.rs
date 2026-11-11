@@ -716,10 +716,9 @@ impl Launcher {
                     .hover(|s| s.bg(white(fill::BUTTON_HOVER)))
                     .cursor_pointer()
                     .child(microsoft::logo(16.))
-                    .child(
-                        ui::text(14., FontWeight::MEDIUM, ink::FULL)
-                            .child(tr("Sign in with Microsoft")),
-                    )
+                    .child(ui::text(14., FontWeight::MEDIUM, ink::FULL).child(tr(
+                        microsoft::sign_in_label(self.settings.authenticate_with),
+                    )))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.start_sign_in();
                         cx.notify();

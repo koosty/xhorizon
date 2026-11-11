@@ -1,0 +1,17 @@
+{
+  "hooks": [
+    {
+      "name": "account_texture_uris",
+      "target": "horizon_client_render::gfx::native_render::native_account_texture_uris",
+      "side": "client",
+      "cancellable": false,
+      "mod_api": {
+        "contract": "replace",
+        "out": "uris"
+      }
+    }
+  ],
+  "rust_summary": "the texture hosts an account may load from, answered by a mod before the game's own list (`native_account_texture_uris`).",
+  "doc_summary": "`native_account_texture_uris(uris)` runs before the game chooses the texture URL templates it may load: the first mod to answer sets `uris`, and the game uses them instead. Bundles need \"hooks\": @API:account_texture_uris@.",
+  "comments": ["crates/horizon-client-render/src/gfx/native_render.rs"]
+}

@@ -184,19 +184,20 @@ pub(super) fn lock_within(
     })
 }
 
-fn read(store: &dyn SecretStore, uuid: &str) -> Result<Option<Secrets>, String> {
+fn read(store: &dyn SecretStore, key: &str) -> Result<Option<Secrets>, String> {
     store
-        .get(uuid)
+        .get(key)
         .map_err(|_| "Could not read the keychain. Unlock it and retry.".to_string())?
         .map(|text| serde_json::from_str(&text).map_err(|_| DAMAGED_SIGN_IN.into()))
         .transpose()
 }
 
 /// Inspect local expiry and remembered failures without contacting authentication services.
-/// Call off the UI thread: unlocking the keychain can require user interaction.
-/// Waits at most `STATUS_WAIT` behind another account operation (`account list`, MCP).
-pub fn status(store: &dyn SecretStore, uuid: &str) -> Status {
-    status_within(store, uuid, &|_| {}, Some(STATUS_WAIT))
+/// `key` is the account's secret key ([`Account::secret_key`]). Call off the UI thread: unlocking
+/// the keychain can require user interaction. Waits at most `STATUS_WAIT` behind another account
+/// operation (`account list`, MCP).
+pub fn status(store: &dyn SecretStore, key: &str) -> Status {
+    status_within(store, key, &|_| {}, Some(STATUS_WAIT))
 }
 
 /// [`status`] for the launcher's own status workers: they run off the UI thread and show
@@ -204,15 +205,15 @@ pub fn status(store: &dyn SecretStore, uuid: &str) -> Status {
 /// [`BUSY`], which would show a false "Could not check sign-in" behind another account's renewal.
 pub fn status_with_progress(
     store: &dyn SecretStore,
-    uuid: &str,
+    key: &str,
     progress: &dyn Fn(Phase),
 ) -> Status {
-    status_within(store, uuid, progress, None)
+    status_within(store, key, progress, None)
 }
 
 fn status_within(
     store: &dyn SecretStore,
-    uuid: &str,
+    key: &str,
     progress: &dyn Fn(Phase),
     within: Option<Duration>,
 ) -> Status {
@@ -220,7 +221,7 @@ fn status_within(
         progress(Phase::Queued);
         let _operation = lock_within(store, within)?;
         progress(Phase::Keychain);
-        Ok::<_, String>(Status::from_secrets(read(store, uuid)?.as_ref()))
+        Ok::<_, String>(Status::from_secrets(read(store, key)?.as_ref()))
     })();
     result.unwrap_or_else(|e| Status::failed(&e))
 }
@@ -271,7 +272,7 @@ pub(super) fn refresh_account(
         progress(Phase::Queued);
         let _operation = lock(store)?;
         progress(Phase::Keychain);
-        let Some(secrets) = read(store, &account.uuid)? else {
+        let Some(secrets) = read(store, &account.secret_key())? else {
             return Ok(Status::from_secrets(None));
         };
         let before =
@@ -307,7 +308,7 @@ pub(super) fn refresh_account(
         if before != after {
             progress(Phase::Saving);
         }
-        if before != after && store.set(&account.uuid, &after).is_err() {
+        if before != after && store.set(&account.secret_key(), &after).is_err() {
             status.state = State::Retry;
             status.message =
                 "The renewed sign-in could not be saved in the keychain. Unlock it and retry."
@@ -349,7 +350,7 @@ pub(super) fn renew_for_game_with(
         return Err(status);
     }
     let _operation = lock(store).map_err(|e| Status::failed(&e))?;
-    let secrets = read(store, &account.uuid)
+    let secrets = read(store, &account.secret_key())
         .map_err(|e| Status::failed(&e))?
         .ok_or_else(|| Status::from_secrets(None))?;
     write_session_file(dir, account, &secrets).map_err(|e| Status::failed(&e))
@@ -388,13 +389,17 @@ pub(super) fn join_server_with(
     accounts: &Path,
     server_id: &str,
 ) -> Result<(), String> {
+    // Mojang's session server takes a Microsoft session only: a custom account's token stays home.
+    if account.provider != Provider::Mojang {
+        return Err("Only a Microsoft account can join a Mojang server.".into());
+    }
     let status = refresh_account(ep, client_id, store, account, accounts, &|_| {});
     if status.state != State::Ready {
         return Err(status.message);
     }
     let secrets = {
         let _operation = lock(store)?;
-        read(store, &account.uuid)?.ok_or("Sign in with a Minecraft account first.")?
+        read(store, &account.secret_key())?.ok_or("Sign in with a Minecraft account first.")?
     };
     let body = json!({
         "accessToken": secrets.minecraft_token,

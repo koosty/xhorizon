@@ -5,6 +5,7 @@
 
 mod agents_page;
 mod art;
+mod authenticate_row;
 mod blocks;
 mod cli;
 mod cli_tools;
@@ -410,6 +411,10 @@ struct Launcher {
     proxy_input: line_edit::LineEdit,
     proxy_focused: bool,
     proxy_focus: FocusHandle,
+    /// Settings' Custom URL field, the same way (`horizon_account_url`).
+    custom_url_input: line_edit::LineEdit,
+    custom_url_focused: bool,
+    custom_url_focus: FocusHandle,
     /// Opt-in data collection: the player's answer and Settings' section (`collection`).
     collection: collection::Collection,
     /// Settings' "Connect an AI agent" (`agents_page`).
@@ -658,6 +663,13 @@ impl Launcher {
             ),
             proxy_focused: false,
             proxy_focus: cx.focus_handle(),
+            custom_url_input: line_edit::LineEdit::new(
+                settings.horizon_account_url.clone().unwrap_or_default(),
+                256,
+                44,
+            ),
+            custom_url_focused: false,
+            custom_url_focus: cx.focus_handle(),
             settings,
             settings_save_error: None,
             links: backend::Links::default(),
@@ -770,7 +782,7 @@ impl Launcher {
         std::thread::spawn(move || {
             let store = account::store();
             let _ = keychain_tx.send(Msg::Keychain(account::no_keychain()));
-            let _ = keychain_tx.send(Msg::Owner(accounts.has_owner(store)));
+            let _ = keychain_tx.send(Msg::Owner(accounts.can_play(store)));
         });
         std::thread::spawn(move || {
             let reused = backend::reuse_prepared_everywhere();
@@ -1174,7 +1186,11 @@ impl Launcher {
                     self.auth_busy.remove(&uuid);
                     self.auth_progress.remove(&uuid);
                     if self.accounts.find(&uuid).is_some() {
-                        if status.state == account::session::State::Ready {
+                        let plays_here = self
+                            .accounts
+                            .find(&uuid)
+                            .is_some_and(|a| self.accounts.provider() == a.provider);
+                        if status.state == account::session::State::Ready && plays_here {
                             self.owner = Some(true);
                         }
                         self.auth_status.insert(uuid, status);
@@ -1193,10 +1209,14 @@ impl Launcher {
                     self.auth_busy.remove(&uuid);
                     self.auth_progress.remove(&uuid);
                     match result {
-                        Ok(owns) => {
+                        Ok((owns, unconfirmed)) => {
                             self.accounts = Accounts::load();
                             self.auth_status.remove(&uuid);
                             self.owner = Some(owns);
+                            if let Some(text) = unconfirmed {
+                                self.sign_in_state =
+                                    Some(SignInState::Done(Err(tr(&text).to_string())));
+                            }
                         }
                         Err(e) => self.sign_in_state = Some(SignInState::Done(Err(e))),
                     }
@@ -1982,8 +2002,7 @@ impl Launcher {
                 };
                 progress(account::session::Phase::Keychain);
                 let store = account::store();
-                let mut status =
-                    account::session::status_with_progress(store, &account.uuid, &progress);
+                let mut status = account::session::status_with_progress(store, &account.secret_key(), &progress);
                 if renew_due && status.state == account::session::State::NeedsRefresh {
                     if let Ok(renewed) =
                         account::session::refresh_with_progress(&account.uuid, &progress)
@@ -2013,7 +2032,7 @@ impl Launcher {
                 let _ = tx.send(Msg::AccountRemoved(
                     uuid,
                     generation,
-                    Ok(Accounts::load().has_owner(account::store())),
+                    Ok((Accounts::load().can_play(account::store()), None)),
                 ));
             }
         });
@@ -2038,7 +2057,15 @@ impl Launcher {
         });
         self.sign_in = Some(match &target {
             Some(account) => SignIn::start_for(account.clone()),
-            None => SignIn::start(),
+            None => match (
+                self.settings.authenticate_with,
+                self.settings.horizon_account_url.clone(),
+            ) {
+                (horizon_launcher::account::Authenticate::HorizonAccount, Some(url)) => {
+                    SignIn::start_horizon_account(url)
+                }
+                _ => SignIn::start(),
+            },
         });
         self.sign_in_target = target;
         self.sign_in_state = Some(SignInState::Starting);
@@ -3464,12 +3491,17 @@ impl Launcher {
                         cx.notify();
                     })),
                 ),
-            Some(false) => div().child(microsoft::sign_in_button("prepare-sign-in", &t).on_click(
-                cx.listener(|this, _: &ClickEvent, _, cx| {
+            Some(false) => div().child(
+                microsoft::sign_in_button(
+                    "prepare-sign-in",
+                    &t,
+                    microsoft::sign_in_label(self.settings.authenticate_with),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.sign_in_to_play();
                     cx.notify();
-                }),
-            )),
+                })),
+            ),
             None => div().child(prepare),
         };
         let owner = self.owner == Some(true);
@@ -3542,21 +3574,33 @@ impl Launcher {
         // Sign in with Microsoft and says Offline itself.
         if !t.glass {
             if self.owner == Some(false) {
+                let custom = self.accounts.provider() == account::Provider::HorizonAccount;
+                let (title, needs) = if custom {
+                    (
+                        microsoft::account_kind(account::Provider::HorizonAccount),
+                        account::NEEDS_HORIZON_ACCOUNT,
+                    )
+                } else {
+                    (
+                        microsoft::account_kind(account::Provider::Mojang),
+                        account::NEEDS_OWNER,
+                    )
+                };
                 rows = rows.child(index_row(
                     5,
-                    tr("Microsoft account"),
+                    title,
+                    Some(div().child(format!("{}.", tr(needs))).into_any_element()),
                     Some(
-                        div()
-                            .child(format!("{}.", tr(account::NEEDS_OWNER)))
-                            .into_any_element(),
-                    ),
-                    Some(
-                        microsoft::sign_in_button("gate-sign-in", &t)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.sign_in_to_play();
-                                cx.notify();
-                            }))
-                            .into_any_element(),
+                        microsoft::sign_in_button(
+                            "gate-sign-in",
+                            &t,
+                            microsoft::sign_in_label(self.settings.authenticate_with),
+                        )
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.sign_in_to_play();
+                            cx.notify();
+                        }))
+                        .into_any_element(),
                     ),
                     &t,
                 ));
@@ -4052,6 +4096,8 @@ impl Launcher {
                     ))
                     .child(group("Network", "globe"))
                     .child(self.proxy_row(n + 4, cx))
+                    .child(self.authenticate_row(n + 4, cx))
+                    .child(self.custom_url_row(n + 4, cx))
                     .child(group("Game", "gamepad"))
                     .child(self.game_architecture_row(n + 5, cx))
                     .child(self.game_args_row(n + 6, cx))
@@ -4421,20 +4467,7 @@ impl Launcher {
             let plays = selected.as_ref() == Some(&a.uuid);
             let uuid = a.uuid.clone();
             let mut actions = div().flex().gap(px(4.));
-            if plays {
-                actions = actions.child(
-                    button(format!("offline-{i}"), "Play offline", Kind::Ghost, &t).on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            let mut accounts = Accounts::load();
-                            accounts.selected = None;
-                            if accounts.save().is_ok() {
-                                this.accounts = accounts;
-                            }
-                            cx.notify();
-                        }),
-                    ),
-                );
-            } else {
+            if !plays {
                 let uuid = uuid.clone();
                 actions = actions.child(
                     button(format!("select-{i}"), "Play as", Kind::Secondary, &t).on_click(
@@ -4452,6 +4485,7 @@ impl Launcher {
                 .and_then(|_| match self.sign_in_state.as_ref() {
                     Some(SignInState::Starting) => Some("Asking Microsoft…"),
                     Some(SignInState::Code(_)) => Some("Waiting for browser sign-in…"),
+                    Some(SignInState::Browser(_)) => Some("Waiting for browser sign-in…"),
                     Some(SignInState::Working(phase)) => Some(phase.label()),
                     _ => None,
                 });
@@ -4503,9 +4537,9 @@ impl Launcher {
                             account::session::Phase::SigningOut,
                         ));
                         let result = accounts
-                            .remove(account::store(), &uuid)
-                            .and_then(|()| accounts.save())
-                            .map(|()| accounts.has_owner(account::store()));
+                            .sign_out(account::store(), &uuid)
+                            .and_then(|unconfirmed| accounts.save().map(|()| unconfirmed))
+                            .map(|unconfirmed| (accounts.can_play(account::store()), unconfirmed));
                         let _ = tx.send(Msg::AccountRemoved(uuid, generation, result));
                     });
                     cx.notify();
@@ -4517,10 +4551,11 @@ impl Launcher {
                 a.name.clone(),
                 Some(
                     div()
-                        .child(tr(if plays {
-                            "Microsoft account · plays"
-                        } else {
-                            "Microsoft account"
+                        .child(tr(match (plays, a.provider) {
+                            (true, account::Provider::Mojang) => "Microsoft account · plays",
+                            (true, account::Provider::HorizonAccount) => "Horizon Account Provider account · plays",
+                            (false, account::Provider::Mojang) => "Microsoft account",
+                            (false, account::Provider::HorizonAccount) => "Horizon Account Provider account",
                         }))
                         .child(account_status_line(status, progress, &t))
                         .when(!busy, |row| {
@@ -4541,10 +4576,15 @@ impl Launcher {
     /// happening (the code to enter, a problem), and its buttons.
     fn sign_in_parts(&self, cx: &mut Context<Self>) -> (String, Div, Option<AnyElement>) {
         let t = self.theme;
-        let configured = account::client_id().is_some();
+        let configured = account::sign_in_configured(self.settings.authenticate_with);
         let busy = matches!(
             self.sign_in_state,
-            Some(SignInState::Starting | SignInState::Code(_) | SignInState::Working(_))
+            Some(
+                SignInState::Starting
+                    | SignInState::Code(_)
+                    | SignInState::Working(_)
+                    | SignInState::Browser(_)
+            )
         );
         let detail = match &self.sign_in_state {
             _ if !configured => div().child(tr(account::NOT_CONFIGURED)),
@@ -4579,6 +4619,21 @@ impl Launcher {
                         .on_click(move |_, _, cx| microsoft::use_different_account(&uri, cx)),
                     )
                 }),
+            Some(SignInState::Browser(url)) => {
+                let url = url.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(tr("Sign in on the page that opens. The password stays with the sign-in service."))
+                    .child(button(
+                        "sign-in-page",
+                        "Open the sign-in page",
+                        Kind::Secondary,
+                        &t,
+                    )
+                    .on_click(move |_, _, cx| cx.open_url(&url)))
+            }
             Some(SignInState::Done(Ok(a))) => {
                 div().child(trf("Signed in as {name}.", &[("name", &a.name)]))
             }
@@ -4676,7 +4731,11 @@ impl Launcher {
             let sign_in = if targeted {
                 button("sign-in", "Sign in again", Kind::Secondary, &t)
             } else {
-                microsoft::sign_in_button("sign-in", &t)
+                microsoft::sign_in_button(
+                    "sign-in",
+                    &t,
+                    microsoft::sign_in_label(self.settings.authenticate_with),
+                )
             };
             let mut actions = div().flex().gap(px(4.)).child(sign_in.on_click(cx.listener(
                 move |this, _: &ClickEvent, _, cx| {
@@ -4702,7 +4761,16 @@ impl Launcher {
         };
         let title = match &self.sign_in_target {
             Some(target) => trf("Sign in again as {name}", &[("name", &target.name)]),
-            None if self.accounts.accounts.is_empty() => tr("Microsoft account").to_owned(),
+            None if self.accounts.accounts.is_empty() => {
+                let custom = self.settings.authenticate_with
+                    == horizon_launcher::account::Authenticate::HorizonAccount;
+                tr(if custom {
+                    "Horizon Account Provider account"
+                } else {
+                    "Microsoft account"
+                })
+                .to_owned()
+            }
             None => tr("Another account").to_owned(),
         };
         (title, detail, action)
@@ -5280,6 +5348,7 @@ impl Render for Launcher {
         self.github.note_focus(window);
         self.args_focused = self.args_focus.is_focused(window);
         self.proxy_focused = self.proxy_focus.is_focused(window);
+        self.custom_url_focused = self.custom_url_focus.is_focused(window);
         let size = window.viewport_size();
         self.window_width = f32::from(size.width);
         self.window_long_side = f32::from(size.width).max(f32::from(size.height));
@@ -5936,6 +6005,8 @@ mod tests {
         let mut shown = None;
         let completed = SignInState::Done(Ok(horizon_launcher::account::Account {
             uuid: "11111111111111111111111111111111".into(),
+            provider: horizon_launcher::account::Provider::Mojang,
+            auth_base_url: None,
             name: "TestAccount".into(),
             skin: None,
             cape: None,

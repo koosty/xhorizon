@@ -1,0 +1,16 @@
+{
+  "hooks": [
+    {
+      "name": "account_session_started",
+      "target": "horizon_client_render::gfx::native_render::native_account_session_started",
+      "side": "client",
+      "cancellable": false,
+      "mod_api": {
+        "contract": "listen"
+      }
+    }
+  ],
+  "rust_summary": "the account the game runs as is set, before its session is stored (`native_account_session_started`).",
+  "doc_summary": "`native_account_session_started(session)` runs when the game's account is set, before the session is stored: a mod may read it, the game writes nothing back. Bundles need \"hooks\": @API:account_session_started@.",
+  "comments": ["crates/horizon-client-render/src/gfx/native_render.rs"]
+}

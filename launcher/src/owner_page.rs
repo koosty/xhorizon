@@ -33,7 +33,7 @@ impl Launcher {
     pub(crate) fn owner_screen(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
         let t = self.theme;
         let n = t.night;
-        let configured = account::client_id().is_some();
+        let configured = account::sign_in_configured(self.settings.authenticate_with);
         // The screenshot preview shows a code without asking Microsoft for one.
         let state = match &self.sign_in_state {
             _ if sign_in_preview() => Shown::Code("https://www.microsoft.com/link", "K7Q-4MXR"),
@@ -41,6 +41,7 @@ impl Launcher {
             Some(SignInState::Starting) => Shown::Starting("Asking Microsoft…"),
             Some(SignInState::Working(phase)) => Shown::Starting(phase.label()),
             Some(SignInState::Code(code)) => Shown::Code(&code.verification_uri, &code.user_code),
+            Some(SignInState::Browser(_)) => Shown::Starting("Waiting for browser sign-in…"),
             Some(SignInState::Done(Err(e))) => Shown::Error(e),
             Some(SignInState::Done(Ok(_))) | None => Shown::Idle,
         };
@@ -198,12 +199,15 @@ impl Launcher {
             Shown::Starting(_) => None,
             Shown::Error(_) if !configured => None,
             _ => Some(
-                microsoft::sign_in_button("owner-sign-in", &t).on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| {
-                        this.sign_in_to_play();
-                        cx.notify();
-                    },
-                )),
+                microsoft::sign_in_button(
+                    "owner-sign-in",
+                    &t,
+                    microsoft::sign_in_label(self.settings.authenticate_with),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.sign_in_to_play();
+                    cx.notify();
+                })),
             ),
         };
         let waiting = matches!(state, Shown::Code(..)).then(|| {
@@ -452,7 +456,9 @@ impl Launcher {
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(gpui::rgb(horizon_theme::glass::ON_LIGHT))
                         .child(microsoft::logo(18.))
-                        .child(tr("Sign in with Microsoft")),
+                        .child(tr(microsoft::sign_in_label(
+                            self.settings.authenticate_with,
+                        ))),
                     &t,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {

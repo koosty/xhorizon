@@ -37,7 +37,14 @@ impl Launcher {
             Some(a) => (
                 Some(a.uuid.clone()),
                 a.name.clone(),
-                (Tone::Live, tr("Microsoft account · online servers too")),
+                (
+                    Tone::Live,
+                    if a.provider == account::Provider::HorizonAccount {
+                        tr("Horizon Account Provider account · online servers too")
+                    } else {
+                        tr("Microsoft account · online servers too")
+                    },
+                ),
             ),
             None => (
                 None,
@@ -99,22 +106,28 @@ impl Launcher {
             (div(), 0)
         };
         let (title, detail, action) = self.sign_in_parts(cx);
-        let configured = account::client_id().is_some();
+        let configured = account::sign_in_configured(self.settings.authenticate_with);
         let idle = self.sign_in_state.is_none()
             || matches!(self.sign_in_state, Some(SignInState::Done(_)));
         let first = !has_accounts && self.sign_in_target.is_none();
+        let custom =
+            self.settings.authenticate_with == horizon_launcher::account::Authenticate::HorizonAccount;
         let heading = if first {
-            tr("Play online with your Microsoft account").to_string()
+            if custom {
+                tr("Play online with your account").to_string()
+            } else {
+                tr("Play online with your Microsoft account").to_string()
+            }
         } else {
             title
         };
         let note: AnyElement = if first && configured && self.sign_in_state.is_none() {
-            div()
-                .child(tr(
-                    "Sign in with the account that owns Minecraft: Java Edition. Your name and \
-                     skin come along to online servers, like in other launchers.",
-                ))
-                .into_any_element()
+            let said = if custom {
+                "Sign in on the service you chose in Settings. Your name and skin come along to online servers, like in other launchers."
+            } else {
+                "Sign in with the account that owns Minecraft: Java Edition. Your name and skin come along to online servers, like in other launchers."
+            };
+            div().child(tr(said)).into_any_element()
         } else {
             detail.into_any_element()
         };
@@ -142,8 +155,10 @@ impl Launcher {
                         .text_size(px(15.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(gpui::rgb(0x100a1f))
-                        .child(microsoft::logo(18.))
-                        .child(tr("Sign in with Microsoft")),
+                        .children((!custom).then(|| microsoft::logo(18.)))
+                        .child(tr(microsoft::sign_in_label(
+                            self.settings.authenticate_with,
+                        ))),
                     &t,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -155,6 +170,15 @@ impl Launcher {
         } else {
             action.map(|a| div().mt(px(20.)).child(a).into_any_element())
         };
+        // The address Custom URL saves: the service the launcher signs in through. Shown only while it passes `horizon_account_host`.
+        let host = if custom {
+            self.settings
+                .horizon_account_url
+                .as_deref()
+                .and_then(|u| horizon_launcher::account::horizon_account_host(u).ok())
+        } else {
+            None
+        };
         div()
             .flex()
             .flex_col()
@@ -164,7 +188,7 @@ impl Launcher {
             .when(has_accounts, |d| {
                 d.child(rows.mx(px(-16.)).mt(px(-16.)).mb(px(16.)))
             })
-            .child(microsoft::logo(36.))
+            .children((!custom).then(|| microsoft::logo(36.)))
             .child(
                 div()
                     .mt(px(20.))
@@ -187,11 +211,21 @@ impl Launcher {
                     ui::text(12., FontWeight::NORMAL, 0.45)
                         .mt(px(12.))
                         .line_height(px(18.))
-                        .child(tr(
-                            "Microsoft's own page opens in your browser. Horizon never sees your \
-                             password.",
-                        )),
+                        .child(tr(if custom {
+                            "The sign-in service's own page opens in your browser. Horizon never sees your password."
+                        } else {
+                            "Microsoft's own page opens in your browser. Horizon never sees your password."
+                        })),
                 )
             })
+            .children(host.map(|host| {
+                ui::text(12., FontWeight::NORMAL, 0.45)
+                    .mt(px(8.))
+                    .line_height(px(18.))
+                    .child(trf(
+                        "The launcher signs in through {host}.",
+                        &[("host", &host)],
+                    ))
+            }))
     }
 }

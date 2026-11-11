@@ -199,19 +199,20 @@ impl Session {
                     SignInState::Starting => json!({ "state": "starting" }),
                     SignInState::Working(phase) => json!({ "state": "working", "phase": phase }),
                     SignInState::Code(c) => json!({ "state": "waiting for the player", "link": c.verification_uri, "code": c.user_code }),
+                    SignInState::Browser(url) => json!({ "state": "waiting for the player", "link": url }),
                     SignInState::Done(Ok(a)) => json!({ "state": "signed in", "name": a.name }),
                     SignInState::Done(Err(e)) => json!({ "state": "failed", "error": e }),
                 });
                 Ok(serde_json::to_string_pretty(&json!({
-                    "accounts": accounts.accounts.iter().map(|a| json!({ "name": a.name, "uuid": a.uuid, "authentication": account::session::status(account::store(), &a.uuid) })).collect::<Vec<_>>(),
+                    "accounts": accounts.accounts.iter().map(|a| json!({ "name": a.name, "uuid": a.uuid, "authentication": account::session::status(account::store(), &a.secret_key()) })).collect::<Vec<_>>(),
                     "plays_as": accounts.selected().map(|a| a.name.clone()),
-                    "sign_in_configured": account::client_id().is_some(),
+                    "sign_in_configured": account::sign_in_configured(horizon_launcher::backend::Settings::load().authenticate_with),
                     // Sign-ins outlast the launcher: in the keychain, or in the secrets file
                     // where it refused them (`secrets_file`: the file holds a sign-in).
                     "keychain": account::store().persistent(),
                     "secrets_file": account::in_secrets_file(),
                     // Play needs an account that owns the game (the owner gate).
-                    "owner": accounts.has_owner(account::store()),
+                    "owner": accounts.can_play(account::store()),
                     "sign_in": sign_in,
                 }))
                 .unwrap())
@@ -221,7 +222,15 @@ impl Session {
                 if let Some(s) = self.sign_in.take() {
                     s.cancel();
                 }
-                let sign_in = SignIn::start();
+                let sign_in = match horizon_launcher::backend::Settings::load() {
+                    s if s.authenticate_with == horizon_launcher::account::Authenticate::HorizonAccount => {
+                        match s.horizon_account_url {
+                            Some(url) => SignIn::start_horizon_account(url),
+                            None => SignIn::start(),
+                        }
+                    }
+                    _ => SignIn::start(),
+                };
                 let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 let state = loop {
                     match sign_in.state() {
@@ -233,6 +242,9 @@ impl Session {
                 };
                 self.sign_in = Some(sign_in);
                 match state {
+                    SignInState::Browser(url) => Ok(format!(
+                        "Ask the player to open {url} and sign in. Then check accounts."
+                    )),
                     SignInState::Code(c) => Ok(format!(
                         "Ask the player to open {} and enter the code {}. Then check accounts.",
                         c.verification_uri, c.user_code
